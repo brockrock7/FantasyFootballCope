@@ -1,0 +1,72 @@
+name: Update and publish fantasy dashboard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: fantasy-dashboard-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out dashboard and saved snapshots
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect live scores and probability snapshot
+        run: python live_logger.py
+
+      - name: Build season dashboard
+        run: python expected_wins.py
+
+      - name: Save updated live history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add live_week_*.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update live fantasy scores"
+            git push
+          fi
+
+      - name: Prepare Pages site
+        run: |
+          mkdir -p site
+          cp xwins_dashboard_2026.html site/index.html
+          cp live_week_*.json site/ 2>/dev/null || true
+          touch site/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
