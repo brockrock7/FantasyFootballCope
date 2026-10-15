@@ -80,10 +80,17 @@ def _raw_trade_transactions(league, week):
     player_class = getattr(module, "Player")
     transactions = []
     malformed_rows = 0
+    trade_dates = []
 
     for raw in rows:
         if not isinstance(raw, dict) or str(raw.get("type", "")).upper() != "TRADE_ACCEPT":
             continue
+        raw_date = raw.get("processDate") or raw.get("acceptedDate") or raw.get("proposedDate")
+        if raw_date:
+            try:
+                trade_dates.append(int(raw_date))
+            except (TypeError, ValueError):
+                pass
         normalized = dict(raw)
         if not normalized.get("status"):
             # A TRADE_ACCEPT row with an acceptance/process timestamp is a
@@ -105,7 +112,94 @@ def _raw_trade_transactions(league, week):
     fill_items = getattr(league, "_fill_trade_accept_from_player_cards", None)
     if transactions and callable(fill_items):
         fill_items(transactions, week, {"TRADE_ACCEPT"}, True, None, "week", player_class)
-    return transactions, malformed_rows
+    return transactions, malformed_rows, trade_dates
+
+
+def _activity_trade_rows(league, date_weeks):
+    """Rebuild team-to-team movements from ESPN's league activity feed.
+
+    mTransactions2 can omit the player legs for deals between other managers.
+    The league activity feed emits matching TRADE_SENT and TRADE_RECEIVED
+    events, so pair those by player and team to recover the full trade.
+    """
+    activities = []
+    offset = 0
+    page_size = 25
+    seen_pages = set()
+    for _ in range(40):  # cap backfill at 1,000 activity topics
+        page = league.recent_activity(size=page_size, msg_type="TRADED", offset=offset) or []
+        if not page:
+            break
+        signature = tuple((int(getattr(a, "date", 0) or 0), repr(a)) for a in page)
+        if signature in seen_pages:
+            break
+        seen_pages.add(signature)
+        activities.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    # Map feed timestamps to the scoring period reported by the transaction
+    # endpoint. Those rows can provide dates even when their status/items are
+    # malformed.
+    dated_weeks = [(stamp, week) for week, stamps in date_weeks.items() for stamp in stamps]
+    trades = {}
+    unmatched_dates = 0
+    for activity in activities:
+        stamp = int(getattr(activity, "date", 0) or 0)
+        if not stamp:
+            continue
+        actions = getattr(activity, "actions", []) or []
+        sent, received = [], []
+        for action in actions:
+            if len(action) < 3:
+                continue
+            team, kind, player = action[:3]
+            tid = getattr(team, "team_id", None)
+            pid = getattr(player, "playerId", player if isinstance(player, (int, str)) else None)
+            if tid is None or pid is None:
+                continue
+            try:
+                entry = (int(pid), str(tid))
+            except (TypeError, ValueError):
+                continue
+            if kind == "TRADE_SENT":
+                sent.append(entry)
+            elif kind == "TRADE_RECEIVED":
+                received.append(entry)
+
+        legs = []
+        for player_id, from_id in sent:
+            destinations = [to_id for received_id, to_id in received if received_id == player_id and to_id != from_id]
+            for to_id in destinations[:1]:
+                legs.append({"id": player_id, "from": from_id, "to": to_id})
+        if not legs:
+            continue
+
+        participants = sorted({leg[side] for leg in legs for side in ("from", "to")})
+        if len(participants) < 2:
+            continue
+        if dated_weeks:
+            nearest_stamp, week = min(dated_weeks, key=lambda pair: abs(pair[0] - stamp))
+            if abs(nearest_stamp - stamp) > 48 * 60 * 60 * 1000:
+                unmatched_dates += 1
+                continue
+        else:
+            unmatched_dates += 1
+            continue
+        leg_signature = ",".join(
+            f"{leg['id']}:{leg['from']}>{leg['to']}"
+            for leg in sorted(legs, key=lambda item: (item["id"], item["from"], item["to"]))
+        )
+        trade_key = f"activity:{stamp}:{','.join(participants)}:{leg_signature}"
+        trades[trade_key] = {
+            "id": trade_key,
+            "week": int(week),
+            "date_ms": stamp,
+            "legs": legs,
+            "participants": participants,
+        }
+    return list(trades.values()), unmatched_dates
 
 
 def _current_rosters(league):
@@ -139,9 +233,11 @@ def _trade_data(league, team_names, completed_week):
     incomplete_trade_rows = 0
     warning = ""
     malformed_weeks = []
+    date_weeks = defaultdict(list)
     for week in range(1, max(league.current_week, 1) + 1):
         try:
-            transactions, malformed_rows = _raw_trade_transactions(league, week)
+            transactions, malformed_rows, trade_dates = _raw_trade_transactions(league, week)
+            date_weeks[week].extend(trade_dates)
             if malformed_rows:
                 malformed_weeks.append(week)
                 print(f"Skipped {malformed_rows} malformed ESPN trade row(s) for week {week}")
@@ -181,6 +277,25 @@ def _trade_data(league, team_names, completed_week):
                 "legs": legs,
                 "participants": participants,
             }
+
+    # ESPN's transaction endpoint may only include item movements for the
+    # authenticated manager's trades. Fill gaps from the league-wide activity
+    # feed, which reports paired sent/received rows for all teams.
+    try:
+        activity_trades, unmatched_activity = _activity_trade_rows(league, date_weeks)
+        for trade in activity_trades:
+            signature = sorted((leg["id"], leg["from"], leg["to"]) for leg in trade["legs"])
+            match_key = next((key for key, existing in raw_trades.items()
+                              if sorted((leg["id"], leg["from"], leg["to"])
+                                        for leg in existing["legs"]) == signature), None)
+            if match_key is not None:
+                raw_trades.pop(match_key, None)
+            raw_trades[trade["id"]] = trade
+        if unmatched_activity:
+            print(f"Could not map {unmatched_activity} ESPN activity trade event(s) to a scoring week")
+    except Exception as exc:
+        warning = "ESPN's league activity feed could not be read; only trade details returned by its transaction endpoint are shown."
+        print(f"League-wide trade activity unavailable: {exc}")
 
     player_ids = sorted({leg["id"] for trade in raw_trades.values() for leg in trade["legs"]})
     player_data = {}
