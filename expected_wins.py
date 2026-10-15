@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import importlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,54 @@ def _team_ids(box):
     )
 
 
+def _raw_trade_transactions(league, week):
+    """Fetch trade rows without espn-api's strict required-status conversion.
+
+    Some ESPN mTransactions2 rows omit ``status``. The espn-api Transaction
+    constructor indexes that field directly, which can otherwise discard an
+    entire scoring period. Normalize only accepted trade rows with a usable
+    completion date, then let espn-api fill missing player legs where supported.
+    """
+    params = {"view": "mTransactions2", "scoringPeriodId": week}
+    filters = {"transactions": {"filterType": {"value": ["TRADE_ACCEPT"]}}}
+    data = league.espn_request.league_get(
+        params=params,
+        headers={"x-fantasy-filter": json.dumps(filters)},
+    )
+    rows = data.get("transactions") or []
+    module = importlib.import_module(type(league).__module__)
+    transaction_class = getattr(module, "Transaction")
+    player_class = getattr(module, "Player")
+    transactions = []
+    malformed_rows = 0
+
+    for raw in rows:
+        if not isinstance(raw, dict) or str(raw.get("type", "")).upper() != "TRADE_ACCEPT":
+            continue
+        normalized = dict(raw)
+        if not normalized.get("status"):
+            # A TRADE_ACCEPT row with an acceptance/process timestamp is a
+            # completed deal; rows without either marker remain untrusted.
+            if normalized.get("processDate") or normalized.get("acceptedDate"):
+                normalized["status"] = "EXECUTED"
+            else:
+                malformed_rows += 1
+                continue
+        try:
+            transactions.append(transaction_class(
+                normalized, league.player_map, league.get_team_data
+            ))
+        except (KeyError, TypeError, ValueError):
+            malformed_rows += 1
+
+    # ESPN sometimes omits trade items except for one participant. Use the
+    # library's item-filling helper when this installed version provides it.
+    fill_items = getattr(league, "_fill_trade_accept_from_player_cards", None)
+    if transactions and callable(fill_items):
+        fill_items(transactions, week, {"TRADE_ACCEPT"}, True, None, "week", player_class)
+    return transactions, malformed_rows
+
+
 def _current_rosters(league):
     result = {}
     for team in league.teams:
@@ -92,28 +141,14 @@ def _trade_data(league, team_names, completed_week):
     malformed_weeks = []
     for week in range(1, max(league.current_week, 1) + 1):
         try:
-            transactions = league.transactions(
-                scoring_period=week,
-                types={"TRADE_ACCEPT"},
-                fill_trade_items=True,
-                fill_from="week",
-            )
-        except Exception as exc:  # keep the rest of the public dashboard available
-            # The library raises this when a scoring period has no
-            # transactions key. That is normal for quiet weeks; keep looking
-            # because later weeks may contain trades.
-            if "no transactions found" in str(exc).lower():
-                continue
-            # ESPN can return a transaction row without the status field
-            # required by espn-api's Transaction parser. Skip that scoring
-            # period instead of preventing later weeks from being inspected.
-            if isinstance(exc, KeyError) and exc.args == ("status",):
+            transactions, malformed_rows = _raw_trade_transactions(league, week)
+            if malformed_rows:
                 malformed_weeks.append(week)
-                print(f"Skipping malformed ESPN transaction data for week {week}: missing status")
-                continue
+                print(f"Skipped {malformed_rows} malformed ESPN trade row(s) for week {week}")
+        except Exception as exc:  # keep the rest of the public dashboard available
             warning = "ESPN returned an error while reading transaction history. Verify the ESPN_S2 and SWID secrets and check the Actions build log for details."
             print(f"Trade history unavailable for week {week}: {exc}")
-            break
+            continue
         for transaction in transactions or []:
             status = str(getattr(transaction, "status", "")).upper()
             if getattr(transaction, "type", "") != "TRADE_ACCEPT" or status != "EXECUTED":
@@ -210,7 +245,7 @@ def _trade_data(league, team_names, completed_week):
         warning = (warning + " " if warning else "") + f"{incomplete_trade_rows} trade row(s) had incomplete player movements and were left out; authenticated ESPN cookies may be needed."
     if malformed_weeks:
         skipped = ", ".join(str(week) for week in malformed_weeks)
-        warning = (warning + " " if warning else "") + f"ESPN returned malformed transaction data for week(s) {skipped}; those week(s) were skipped while later weeks were checked."
+        warning = (warning + " " if warning else "") + f"Some malformed ESPN transaction rows were skipped for week(s) {skipped}; valid trades from those weeks were still included."
 
     ordered = sorted(team_names.items(), key=lambda item: (item[1].lower() != "league manager", item[1].lower()))
     ratings = []
@@ -383,7 +418,7 @@ D.teams.forEach((team,i)=>{const cell=document.createElement('div');cell.classNa
 const posChart=new Chart(document.getElementById('positionChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.groups.map((g,i)=>({label:g,data:[],backgroundColor:colors[i]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=t;posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[D.groups[i]]||0));posChart.update();}
 const positionButtons=fillTeamButtons('positionTeams',showPosition);
-const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,title:{display:true,text:'Cumulative wins'}}}}});
+const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,max:Math.max(1,Number(D.completed_week)||0),title:{display:true,text:'Cumulative wins (maximum possible = completed weeks)'}}}}});
 function showLuck(team){const r=luckData.get(team);const weeks=r?.weeks||[];luckLine.options.plugins.title.text=team;luckLine.data.labels=['Start',...weeks.map(w=>'W'+w)];luckLine.data.datasets[0].data=[0,...(r?.cum_xw||[])];luckLine.data.datasets[1].data=[0,...(r?.cum_actual||[])];luckLine.update();document.getElementById('luckNote').textContent=r?`Actual ${r.actual.toFixed(1)} · Expected ${r.xw.toFixed(2)} · Luck ${r.luck>=0?'+':''}${r.luck.toFixed(2)} · Expected win rate ${(100*r.xwin_pct).toFixed(1)}%`:'';}const luckButtons=fillTeamButtons('luckTeams',showLuck);
 new Chart(document.getElementById('luckBars'),{type:'bar',data:{labels:D.season.map(r=>r.team),datasets:[{data:D.season.map(r=>r.luck),backgroundColor:D.season.map(r=>r.luck>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:'Actual wins − expected wins'}}}}});
 const heat=document.getElementById('heat');const hr=document.createElement('tr');['Team',...Array.from({length:D.completed_week},(_,i)=>'W'+(i+1)),'xW','Actual','Luck'].forEach(x=>{const c=document.createElement('th');c.textContent=x;hr.append(c)});heat.append(hr);D.teams.forEach(team=>{const tr=document.createElement('tr');const name=document.createElement('td');name.textContent=team;tr.append(name);(D.heat[team]||[]).forEach(v=>{const td=document.createElement('td');td.textContent=v==null?'—':v.toFixed(2);if(v!=null)td.style.background=`hsl(${120*v},65%,45%)`;tr.append(td)});const r=luckData.get(team)||{xw:0,actual:0,luck:0};[r.xw.toFixed(2),r.actual.toFixed(1),(r.luck>=0?'+':'')+r.luck.toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});heat.append(tr)});
