@@ -81,10 +81,12 @@ def _raw_trade_transactions(league, week):
     transactions = []
     malformed_rows = 0
     trade_dates = []
+    found_trade = False
 
     for raw in rows:
         if not isinstance(raw, dict) or str(raw.get("type", "")).upper() != "TRADE_ACCEPT":
             continue
+        found_trade = True
         raw_date = raw.get("processDate") or raw.get("acceptedDate") or raw.get("proposedDate")
         if raw_date:
             try:
@@ -112,7 +114,7 @@ def _raw_trade_transactions(league, week):
     fill_items = getattr(league, "_fill_trade_accept_from_player_cards", None)
     if transactions and callable(fill_items):
         fill_items(transactions, week, {"TRADE_ACCEPT"}, True, None, "week", player_class)
-    return transactions, malformed_rows, trade_dates
+    return transactions, malformed_rows, trade_dates, found_trade
 
 
 def _activity_trade_rows(league, date_weeks):
@@ -202,6 +204,71 @@ def _activity_trade_rows(league, date_weeks):
     return list(trades.values()), unmatched_dates
 
 
+def _roster_history_trade_rows(league, trade_weeks):
+    """Infer reciprocal player transfers from ESPN's historical roster snapshots.
+
+    This is a fallback for trade weeks where ESPN returns a TRADE_ACCEPT row
+    but hides its item list. A roster ownership change in both directions
+    between the same two teams in that scoring period identifies the deal.
+    """
+    cache = {}
+
+    def roster_owners(week):
+        if week not in cache:
+            data = league.espn_request.league_get(
+                params={"view": "mRoster", "scoringPeriodId": week}
+            )
+            owners = {}
+            for team in data.get("teams", []) or []:
+                team_id = str(team.get("id"))
+                roster = team.get("roster") or {}
+                entries = roster.get("entries", []) if isinstance(roster, dict) else []
+                for entry in entries:
+                    pool = entry.get("playerPoolEntry") or {}
+                    player = pool.get("player") or entry.get("player") or {}
+                    player_id = player.get("id")
+                    if player_id is not None:
+                        owners[str(player_id)] = team_id
+            cache[week] = owners
+        return cache[week]
+
+    inferred = []
+    for week in sorted(trade_weeks):
+        if week < 1:
+            continue
+        try:
+            before = roster_owners(week - 1)
+            after = roster_owners(week)
+        except Exception as exc:
+            print(f"Could not read roster history for trade week {week}: {exc}")
+            continue
+        moved = defaultdict(list)
+        for player_id, old_team in before.items():
+            new_team = after.get(player_id)
+            if new_team and new_team != old_team:
+                moved[(old_team, new_team)].append(int(player_id))
+
+        pairs = set()
+        for (from_id, to_id), player_ids in moved.items():
+            if (to_id, from_id) in moved:
+                pairs.add(tuple(sorted((from_id, to_id))))
+        for team_a, team_b in sorted(pairs):
+            legs = ([{"id": pid, "from": team_a, "to": team_b} for pid in moved[(team_a, team_b)]]
+                    + [{"id": pid, "from": team_b, "to": team_a} for pid in moved[(team_b, team_a)]])
+            if not legs:
+                continue
+            legs.sort(key=lambda leg: (leg["id"], leg["from"], leg["to"]))
+            trade_id = f"roster:{week}:{team_a}:{team_b}:" + ",".join(str(leg["id"]) for leg in legs)
+            inferred.append({
+                "id": trade_id,
+                "week": int(week),
+                "date_ms": 0,
+                "legs": legs,
+                "participants": [team_a, team_b],
+            })
+    return inferred
+
+
 def _current_rosters(league):
     result = {}
     for team in league.teams:
@@ -234,9 +301,12 @@ def _trade_data(league, team_names, completed_week):
     warning = ""
     malformed_weeks = []
     date_weeks = defaultdict(list)
+    trade_weeks = set()
     for week in range(1, max(league.current_week, 1) + 1):
         try:
-            transactions, malformed_rows, trade_dates = _raw_trade_transactions(league, week)
+            transactions, malformed_rows, trade_dates, found_trade = _raw_trade_transactions(league, week)
+            if found_trade:
+                trade_weeks.add(week)
             date_weeks[week].extend(trade_dates)
             if malformed_rows:
                 malformed_weeks.append(week)
@@ -296,6 +366,25 @@ def _trade_data(league, team_names, completed_week):
     except Exception as exc:
         warning = "ESPN's league activity feed could not be read; only trade details returned by its transaction endpoint are shown."
         print(f"League-wide trade activity unavailable: {exc}")
+
+    try:
+        roster_trades = _roster_history_trade_rows(league, trade_weeks)
+        for trade in roster_trades:
+            existing = next((item for item in raw_trades.values()
+                             if item["week"] == trade["week"]
+                             and set(item["participants"]) == set(trade["participants"])), None)
+            if existing is None:
+                raw_trades[trade["id"]] = trade
+                continue
+            existing_legs = {(leg["id"], leg["from"], leg["to"]) for leg in existing["legs"]}
+            for leg in trade["legs"]:
+                signature = (leg["id"], leg["from"], leg["to"])
+                if signature not in existing_legs:
+                    existing["legs"].append(leg)
+                    existing_legs.add(signature)
+    except Exception as exc:
+        warning = (warning + " " if warning else "") + "ESPN historical roster data could not be used to fill missing trade movements."
+        print(f"Historical roster trade recovery unavailable: {exc}")
 
     player_ids = sorted({leg["id"] for trade in raw_trades.values() for leg in trade["legs"]})
     player_data = {}
