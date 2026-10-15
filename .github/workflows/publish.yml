@@ -1,9 +1,5 @@
 name: Update and publish fantasy dashboard
 
-concurrency:
-  group: fantasy-dashboard-publish
-  cancel-in-progress: false
-
 on:
   push:
     branches: [main]
