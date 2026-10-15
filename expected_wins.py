@@ -22,14 +22,6 @@ YEAR = 2026
 ROOT = Path(__file__).resolve().parent
 GROUPS = ["QB", "RB", "WR", "TE", "K", "DEF"]
 POSITIONS = {"QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE", "K": "K", "D/ST": "DEF"}
-SOURCES = ["Drafted", "Traded", "Waivers", "Unknown"]
-SOURCE_MAP = {
-    "DRAFT": "Drafted", "DRAFTED": "Drafted",
-    "TRADE": "Traded", "TRADED": "Traded",
-    "WAIVER": "Waivers", "WAIVERS": "Waivers", "WAIVER_WIRE": "Waivers",
-    "WAIVERS_TRADITIONAL": "Waivers", "WAIVERS_FAAB": "Waivers",
-    "FREE_AGENT": "Waivers", "FREEAGENT": "Waivers", "FA": "Waivers",
-}
 
 
 def _safe_float(value):
@@ -52,47 +44,6 @@ def _trade_rating(points_per_week):
     if points_per_week > -5:
         return "Lost the Trade"
     return "Fleeced"
-
-
-def _source_bucket(value):
-    """Normalize ESPN acquisition labels to the dashboard's three buckets."""
-    label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
-    return SOURCE_MAP.get(label, "Unknown")
-
-
-def _week_acquisition_sources(league, week):
-    """Return acquisition labels directly from ESPN's historical roster view.
-
-    This avoids relying on whichever subset of roster fields the library's
-    Player objects expose for a particular ESPN response shape.
-    """
-    by_team_and_player = {}
-    by_player = {}
-    data = league.espn_request.league_get(
-        params={"view": "mRoster", "scoringPeriodId": week}
-    )
-    for team in data.get("teams", []) if isinstance(data, dict) else []:
-        team_id = str(team.get("id", ""))
-        roster = team.get("roster") or {}
-        entries = roster.get("entries", []) if isinstance(roster, dict) else roster
-        for entry in entries or []:
-            if not isinstance(entry, dict):
-                continue
-            pool = entry.get("playerPoolEntry") or {}
-            player = pool.get("player") or {}
-            player_id = entry.get("playerId") or pool.get("id") or player.get("id")
-            if player_id is None:
-                continue
-            source = _source_bucket(
-                entry.get("acquisitionType")
-                or pool.get("acquisitionType")
-                or player.get("acquisitionType")
-            )
-            pid = int(player_id)
-            if source != "Unknown":
-                by_team_and_player[(team_id, pid)] = source
-                by_player[pid] = source
-    return by_team_and_player, by_player
 
 
 def _bucket(position, slot):
@@ -205,7 +156,6 @@ def _trade_data(league, team_names, completed_week):
     team_value = defaultdict(float)
     team_wins = defaultdict(int)
     team_losses = defaultdict(int)
-    team_week_points = defaultdict(lambda: defaultdict(float))
     for trade in raw_trades.values():
         by_team = {}
         for tid in trade["participants"]:
@@ -219,8 +169,6 @@ def _trade_data(league, team_names, completed_week):
                 for scored_week in range(trade["week"] + 1, completed_week + 1):
                     weekly_points = _safe_float((stats.get(scored_week) or stats.get(str(scored_week)) or {}).get("points"))
                     points_after += weekly_points
-                    team_week_points[leg["to"]][scored_week] += weekly_points
-                    team_week_points[leg["from"]][scored_week] -= weekly_points
             moved = {"id": leg["id"], "name": name, "points": round(points_after, 2)}
             by_team[leg["to"]]["incoming"].append(moved)
             by_team[leg["from"]]["outgoing"].append(moved)
@@ -261,12 +209,7 @@ def _trade_data(league, team_names, completed_week):
             label = _trade_rating(team_value.get(tid, 0.0)) if has_trades else "No trades yet"
             ratings.append({"team_id": tid, "team": name, "score": round(team_value.get(tid, 0.0), 2),
                             "wins": team_wins.get(tid, 0), "losses": team_losses.get(tid, 0), "rating": label})
-    weekly_points = {
-        tid: [{"week": week, "points": round(team_week_points[tid].get(week, 0.0), 2)}
-              for week in range(1, completed_week + 1)]
-        for tid in team_names
-    }
-    return result, warning, ratings, weekly_points
+    return result, warning, ratings
 
 
 def _build_payload(league):
@@ -279,17 +222,10 @@ def _build_payload(league):
 
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
-    source_week = defaultdict(lambda: defaultdict(lambda: {s: 0.0 for s in SOURCES}))
     position_totals = defaultdict(lambda: {g: 0.0 for g in GROUPS})
 
     for week in range(1, max_week + 1):
         matchups = league.box_scores(week)
-        id_to_source, id_only_source = {}, {}
-        try:
-            id_to_source, id_only_source = _week_acquisition_sources(league, week)
-        except Exception as exc:
-            print(f"Could not load historical acquisition types for week {week}: {exc}")
-
         week_scores = []
         for box in matchups:
             home_id, away_id = _team_ids(box)
@@ -315,13 +251,6 @@ def _build_payload(league):
                     points = _safe_float(getattr(player, "points", 0))
                     position_week[name][week][pos] += points
                     position_totals[name][pos] += points
-                    player_id = int(getattr(player, "playerId", 0))
-                    source = (
-                        id_to_source.get((str(tid), player_id))
-                        or id_only_source.get(player_id)
-                        or _source_bucket(getattr(player, "acquisitionType", ""))
-                    )
-                    source_week[name][week][source] += points
         if week > completed_week:
             continue
         if not week_scores or sum(x[1] for x in week_scores) <= 0:
@@ -364,10 +293,6 @@ def _build_payload(league):
         name: [{"week": w, **{g: round(position_week[name][w][g], 2) for g in GROUPS}} for w in weeks_for_stats]
         for name in labels
     }
-    weekly_sources = {
-        name: [{"week": w, **{s: round(source_week[name][w][s], 2) for s in SOURCES}} for w in weeks_for_stats]
-        for name in labels
-    }
     heat = {name: [season_by_team.get(name, {}).get("weekly_xw", {}).get(str(w)) for w in range(1, completed_week + 1)] for name in labels}
 
     live_weeks = []
@@ -378,15 +303,15 @@ def _build_payload(league):
             continue
     live_weeks = sorted(set(live_weeks))
 
-    trades, trade_warning, ratings, trade_weekly_points = _trade_data(league, team_names, completed_week)
+    trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
     return {
-        "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS, "sources": SOURCES,
+        "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS,
         "current_week": int(league.current_week), "completed_week": completed_week,
         "weeks": weeks_for_stats, "season": season, "heat": heat,
         "position_totals": {name: position_totals[name] for name in labels},
-        "weekly_positions": weekly_positions, "weekly_sources": weekly_sources,
+        "weekly_positions": weekly_positions,
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
-        "trade_ratings": ratings, "trade_weekly_points": trade_weekly_points,
+        "trade_ratings": ratings,
         "team_abbrevs": {str(t.team_name): str(getattr(t, "team_abbrev", "") or "") for t in teams},
         "rosters": current_rosters,
         "roster_team_ids": {str(t.team_name): str(t.team_id) for t in teams},
@@ -412,7 +337,6 @@ def _html(payload):
 <section class="panel active" id="panel-team" role="tabpanel">
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
-<article class="card"><h2>Weekly points by acquisition source</h2><p>Starter points grouped by how each player joined that roster: drafted, traded for, or added from waivers/free agency.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article>
 </section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
@@ -426,7 +350,7 @@ def _html(payload):
 </section>
 
 <section class="panel" id="panel-trades" role="tabpanel">
-<article class="card"><h2>Trade results by team</h2><p>Incoming and outgoing players' fantasy points after the trade week. Ratings use net points per week: GM of the Year, Won the Trade, Even Trade, Lost the Trade, or Fleeced.</p><div class="toolbar"><span>Team:</span><div id="tradeTeams" class="team-buttons" aria-label="Choose team"></div><span id="teamRating"></span></div><div class="chartbox"><canvas id="tradeWeekChart"></canvas></div><div id="tradeNotice" class="notice" style="display:none"></div><div id="teamTrades"></div></article>
+<article class="card"><h2>Trades by team</h2><p>Every completed trade involving the selected team, with incoming and outgoing players, points earned after the trade, and an individual trade rating.</p><div class="toolbar"><span>Team:</span><div id="tradeTeams" class="team-buttons" aria-label="Choose team"></div><span id="teamRating"></span></div><div id="tradeNotice" class="notice" style="display:none"></div><div id="teamTrades"></div></article>
 <article class="card"><h2>Trade calculator</h2><p>Choose players from two rosters. The estimate compares their projected remaining season points from ESPN.</p><div class="trade-grid"><div><label for="calcTeamA">Your team</label><select id="calcTeamA"></select><label for="givePlayers">Players you give</label><select class="player-select" id="givePlayers" multiple></select></div><div><label for="calcTeamB">Other team</label><select id="calcTeamB"></select><label for="getPlayers">Players you receive</label><select class="player-select" id="getPlayers" multiple></select></div></div><div class="toolbar"><button id="calcTrade">Evaluate trade</button></div><div id="calcResult" class="calculator-result"></div></article>
 </section>
 <div class="sub" id="updated"></div>
@@ -448,9 +372,6 @@ D.teams.forEach((team,i)=>{const cell=document.createElement('div');cell.classNa
 const posChart=new Chart(document.getElementById('positionChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.groups.map((g,i)=>({label:g,data:[],backgroundColor:colors[i]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=t;posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[D.groups[i]]||0));posChart.update();}
 const positionButtons=fillTeamButtons('positionTeams',showPosition);
-const sourceColors={Drafted:'#4da3ff',Traded:'#da70d6',Waivers:'#f5a623',Unknown:'#8b98a5'};const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(s=>({label:s,data:[],backgroundColor:sourceColors[s]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
-function showSource(t){const rows=D.weekly_sources[t]||[];sourceChart.options.plugins.title.text=t;sourceChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[D.sources[i]]||0));sourceChart.update();}const sourceButtons=fillTeamButtons('sourceTeams',showSource);
-
 const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,title:{display:true,text:'Cumulative wins'}}}}});
 function showLuck(team){const r=luckData.get(team);const weeks=r?.weeks||[];luckLine.options.plugins.title.text=team;luckLine.data.labels=['Start',...weeks.map(w=>'W'+w)];luckLine.data.datasets[0].data=[0,...(r?.cum_xw||[])];luckLine.data.datasets[1].data=[0,...(r?.cum_actual||[])];luckLine.update();document.getElementById('luckNote').textContent=r?`Actual ${r.actual.toFixed(1)} · Expected ${r.xw.toFixed(2)} · Luck ${r.luck>=0?'+':''}${r.luck.toFixed(2)} · Expected win rate ${(100*r.xwin_pct).toFixed(1)}%`:'';}const luckButtons=fillTeamButtons('luckTeams',showLuck);
 new Chart(document.getElementById('luckBars'),{type:'bar',data:{labels:D.season.map(r=>r.team),datasets:[{data:D.season.map(r=>r.luck),backgroundColor:D.season.map(r=>r.luck>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:'Actual wins − expected wins'}}}}});
@@ -462,9 +383,9 @@ function showLive(){const snap=liveCache[selectedLiveWeek];if(!snap||!snap.match
 async function loadLive(){const week=selectedLiveWeek;if(!week||!/^\d+$/.test(week)){showLive();return;}try{const res=await fetch(`live_week_${week}.json?t=${Date.now()}`,{cache:'no-store'});if(res.ok)liveCache[week]=await res.json();}catch(_){}showLive();}
 fillLiveWeeks();loadLive();
 
-const ratingByTeam=new Map(D.trade_ratings.map(r=>[r.team_id,r]));const teamIdByName=new Map(D.teams.map(n=>[n,D.roster_team_ids[n]]));const tradeWeekChart=new Chart(document.getElementById('tradeWeekChart'),{type:'line',data:{labels:[],datasets:[{label:'Net traded-player points',data:[],borderColor:colors[0],backgroundColor:'rgba(77,163,255,.18)',fill:true,pointRadius:3,borderWidth:2.5}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{title:{display:true,text:'Incoming points − outgoing points'}}}}});
+const ratingByTeam=new Map(D.trade_ratings.map(r=>[r.team_id,r]));const teamIdByName=new Map(D.teams.map(n=>[n,D.roster_team_ids[n]]));
 function ratingClass(label){return label==='GM of the Year'?'gm':label==='Fleeced'?'fleeced':'inmix';}
-function renderTrades(selected){const tid=teamIdByName.get(selected);const rating=ratingByTeam.get(String(tid));const badge=document.getElementById('teamRating');badge.className='badge '+ratingClass(rating?.rating||'');badge.textContent=rating?`${rating.rating} · Net ${rating.score.toFixed(2)} pts/week · ${rating.wins} wins / ${rating.losses} losses`:'No rating yet';const weekly=D.trade_weekly_points?.[String(tid)]||[];tradeWeekChart.options.plugins.title.text=selected+' · Traded-player points by week';tradeWeekChart.data.labels=weekly.map(r=>'W'+r.week);tradeWeekChart.data.datasets[0].data=weekly.map(r=>r.points);tradeWeekChart.update();const area=document.getElementById('teamTrades');area.replaceChildren();const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No trade records are available for this team.';area.append(p);return;}list.sort((a,b)=>b.week-a.week).forEach(t=>{const side=t.sides.find(s=>s.team===selected);const card=document.createElement('div');card.className='trade-card';const h=document.createElement('h3');const title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>s.team).join(' ↔ ')}`;const tradeBadge=document.createElement('span');tradeBadge.className='badge trade-rating '+ratingClass(side.rating);tradeBadge.textContent=side.rating;h.append(title,tradeBadge);const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;card.append(h,meta,score);area.append(card)});}
+function renderTrades(selected){const tid=teamIdByName.get(selected);const rating=ratingByTeam.get(String(tid));const badge=document.getElementById('teamRating');badge.className='badge '+ratingClass(rating?.rating||'');badge.textContent=rating?`${rating.rating} · Net ${rating.score.toFixed(2)} pts/week · ${rating.wins} wins / ${rating.losses} losses`:'No rating yet';const area=document.getElementById('teamTrades');area.replaceChildren();const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No trade records are available for this team.';area.append(p);return;}list.sort((a,b)=>b.week-a.week).forEach(t=>{const side=t.sides.find(s=>s.team===selected);const card=document.createElement('div');card.className='trade-card';const h=document.createElement('h3');const title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>s.team).join(' ↔ ')}`;const tradeBadge=document.createElement('span');tradeBadge.className='badge trade-rating '+ratingClass(side.rating);tradeBadge.textContent=side.rating;h.append(title,tradeBadge);const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;card.append(h,meta,score);area.append(card)});}
 document.getElementById('tradeNotice').textContent=D.trade_warning;document.getElementById('tradeNotice').style.display=D.trade_warning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
 function populatePlayers(teamSelect,playersSelect){const team=teamSelect.value;const players=D.rosters[teamIdByName.get(team)]||[];playersSelect.replaceChildren(...players.map(p=>{const o=document.createElement('option');o.value=p.id;o.textContent=`${p.name} (${p.position}) · ${p.projected_remaining.toFixed(1)} projected remaining`;o.dataset.points=p.projected_remaining;return o;}));}const calcA=document.getElementById('calcTeamA'),calcB=document.getElementById('calcTeamB'),give=document.getElementById('givePlayers'),get=document.getElementById('getPlayers');calcA.addEventListener('change',()=>populatePlayers(calcA,give));calcB.addEventListener('change',()=>populatePlayers(calcB,get));populatePlayers(calcA,give);populatePlayers(calcB,get);document.getElementById('calcTrade').addEventListener('click',()=>{const a=[...give.selectedOptions].reduce((s,o)=>s+Number(o.dataset.points),0);const b=[...get.selectedOptions].reduce((s,o)=>s+Number(o.dataset.points),0);const d=b-a;document.getElementById('calcResult').textContent=`You give ${a.toFixed(1)} projected points and receive ${b.toFixed(1)}. Estimated rest-of-season difference: ${d>=0?'+':''}${d.toFixed(1)} points ${d>0?'in your favor':d<0?'against you':'— even'}.`;});
 
