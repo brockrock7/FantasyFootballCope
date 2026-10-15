@@ -89,6 +89,7 @@ def _trade_data(league, team_names, completed_week):
     raw_trades = {}
     incomplete_trade_rows = 0
     warning = ""
+    malformed_weeks = []
     for week in range(1, max(league.current_week, 1) + 1):
         try:
             transactions = league.transactions(
@@ -102,6 +103,13 @@ def _trade_data(league, team_names, completed_week):
             # transactions key. That is normal for quiet weeks; keep looking
             # because later weeks may contain trades.
             if "no transactions found" in str(exc).lower():
+                continue
+            # ESPN can return a transaction row without the status field
+            # required by espn-api's Transaction parser. Skip that scoring
+            # period instead of preventing later weeks from being inspected.
+            if isinstance(exc, KeyError) and exc.args == ("status",):
+                malformed_weeks.append(week)
+                print(f"Skipping malformed ESPN transaction data for week {week}: missing status")
                 continue
             warning = "ESPN returned an error while reading transaction history. Verify the ESPN_S2 and SWID secrets and check the Actions build log for details."
             print(f"Trade history unavailable for week {week}: {exc}")
@@ -200,6 +208,9 @@ def _trade_data(league, team_names, completed_week):
         warning = "No completed trades were returned. If the league has trades, add ESPN_S2 and SWID as GitHub Actions secrets; ESPN may restrict transaction history without them."
     if incomplete_trade_rows:
         warning = (warning + " " if warning else "") + f"{incomplete_trade_rows} trade row(s) had incomplete player movements and were left out; authenticated ESPN cookies may be needed."
+    if malformed_weeks:
+        skipped = ", ".join(str(week) for week in malformed_weeks)
+        warning = (warning + " " if warning else "") + f"ESPN returned malformed transaction data for week(s) {skipped}; those week(s) were skipped while later weeks were checked."
 
     ordered = sorted(team_names.items(), key=lambda item: (item[1].lower() != "league manager", item[1].lower()))
     ratings = []
