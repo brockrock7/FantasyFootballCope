@@ -27,6 +27,7 @@ SOURCE_MAP = {
     "DRAFT": "Drafted", "DRAFTED": "Drafted",
     "TRADE": "Traded", "TRADED": "Traded",
     "WAIVER": "Waivers", "WAIVERS": "Waivers", "WAIVER_WIRE": "Waivers",
+    "WAIVERS_TRADITIONAL": "Waivers", "WAIVERS_FAAB": "Waivers",
     "FREE_AGENT": "Waivers", "FREEAGENT": "Waivers", "FA": "Waivers",
 }
 
@@ -146,7 +147,12 @@ def _trade_data(league, team_names, completed_week):
                 fill_from="week",
             )
         except Exception as exc:  # keep the rest of the public dashboard available
-            warning = "ESPN did not return transaction history. Add ESPN_S2 and SWID as GitHub Actions secrets to enable the trade log."
+            # The library raises this when a scoring period has no
+            # transactions key. That is normal for quiet weeks; keep looking
+            # because later weeks may contain trades.
+            if "no transactions found" in str(exc).lower():
+                continue
+            warning = "ESPN returned an error while reading transaction history. Verify the ESPN_S2 and SWID secrets and check the Actions build log for details."
             print(f"Trade history unavailable for week {week}: {exc}")
             break
         for transaction in transactions or []:
