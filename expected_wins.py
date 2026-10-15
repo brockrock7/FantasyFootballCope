@@ -558,7 +558,7 @@ fillLiveWeeks();loadLive();
 
 const ratingByTeam=new Map(D.trade_ratings.map(r=>[r.team_id,r]));const teamIdByName=new Map(D.teams.map(n=>[n,D.roster_team_ids[n]]));
 function ratingClass(label){return label==='GM of the Year'?'gm':label==='Fleeced'?'fleeced':'inmix';}
-const teamTradeChart=new Chart(document.getElementById('teamTradeChart'),{type:'line',data:{labels:[],datasets:[{label:'Received − sent',data:[],borderColor:colors[0],backgroundColor:'rgba(77,163,255,.12)',fill:false,borderWidth:2.5,pointRadius:3,tension:.2}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},interaction:{mode:'index',intersect:false},scales:{y:{title:{display:true,text:'Fantasy points'},ticks:{precision:1}},x:{title:{display:true,text:'Week'}}}}});
+const teamTradeChart=new Chart(document.getElementById('teamTradeChart'),{type:'line',data:{labels:[],datasets:[{label:'Cumulative received - sent',data:[],borderColor:colors[0],fill:{target:{value:0},above:'rgba(63,185,80,.28)',below:'rgba(248,81,73,.28)'},borderWidth:2.5,pointRadius:3,tension:.2},{label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},interaction:{mode:'index',intersect:false},scales:{y:{min:-1,max:1,title:{display:true,text:'Cumulative fantasy points'},ticks:{precision:1}},x:{title:{display:true,text:'Week'}}}}});
 const individualTradeCharts=new Set();
 function renderTrades(selected){
   const tid=teamIdByName.get(selected),rating=ratingByTeam.get(String(tid));
@@ -568,10 +568,11 @@ function renderTrades(selected){
   individualTradeCharts.forEach(chart=>chart.destroy());individualTradeCharts.clear();area.replaceChildren();
   const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));
   const weekCount=Math.max(0,Number(D.completed_week)||0),weeklyNet=new Map(Array.from({length:weekCount},(_,i)=>[i+1,0]));
-  list.forEach(t=>{const side=t.sides.find(s=>s.team===selected);(side.weekly_points||[]).forEach(row=>weeklyNet.set(Number(row.week),(weeklyNet.get(Number(row.week))||0)+Number(row.net||0)));});
-  document.getElementById('teamTradeTitle').textContent=`${selected} · received players minus sent players by week`;
+  list.forEach(t=>{const side=t.sides.find(s=>s.team===selected);(side.weekly_points||[]).forEach(row=>weeklyNet.set(Number(row.week),(weeklyNet.get(Number(row.week))||0)+Number(row.net||0)));});const weeklyTotals=[...weeklyNet.values()];let runningNet=0;const cumulativeNet=weeklyTotals.map(points=>runningNet+=points);
+  document.getElementById('teamTradeTitle').textContent=`${selected} - cumulative received players minus sent players by week`;
   teamTradeChart.data.labels=[...weeklyNet.keys()].map(w=>'W'+w);
-  teamTradeChart.data.datasets[0].data=[...weeklyNet.values()];teamTradeChart.update();
+  const yMin=Math.min(0,...cumulativeNet),yMax=Math.max(0,...cumulativeNet);teamTradeChart.options.scales.y.min=yMin===yMax?-1:yMin;teamTradeChart.options.scales.y.max=yMin===yMax?1:yMax;
+  teamTradeChart.data.datasets[0].data=cumulativeNet;teamTradeChart.data.datasets[1].data=cumulativeNet.map(()=>0);teamTradeChart.update();
   if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No accepted trade records are available for this team.';area.append(p);return;}
   list.sort((a,b)=>b.week-a.week).forEach(t=>{
     const side=t.sides.find(s=>s.team===selected),card=document.createElement('div');card.className='trade-card';
@@ -586,7 +587,7 @@ function renderTrades(selected){
     const rows=side.weekly_points||[];
     if(rows.length){
       const canvas=document.createElement('canvas');chartBox.append(canvas);
-      const chart=new Chart(canvas,{type:'line',data:{labels:rows.map(r=>'W'+r.week),datasets:[{label:'Received players',data:rows.map(r=>r.incoming),borderColor:colors[0],pointRadius:2,borderWidth:2,tension:.2},{label:'Sent players',data:rows.map(r=>r.outgoing),borderColor:colors[1],pointRadius:2,borderWidth:2,tension:.2}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}},tooltip:{mode:'index',intersect:false}},interaction:{mode:'index',intersect:false},scales:{x:{ticks:{font:{size:9},maxRotation:0}},y:{beginAtZero:true,title:{display:true,text:'Points',font:{size:9}},ticks:{font:{size:9}}}}}});
+      const chart=new Chart(canvas,{type:'line',data:{labels:rows.map(r=>'W'+r.week),datasets:[{label:'Received players',data:rows.map(r=>r.incoming),borderColor:colors[0],fill:{target:1,above:'rgba(63,185,80,.28)',below:'rgba(248,81,73,.28)'},pointRadius:2,borderWidth:2,tension:.2},{label:'Sent players',data:rows.map(r=>r.outgoing),borderColor:colors[1],pointRadius:2,borderWidth:2,tension:.2}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}},tooltip:{mode:'index',intersect:false}},interaction:{mode:'index',intersect:false},scales:{x:{ticks:{font:{size:9},maxRotation:0}},y:{beginAtZero:true,title:{display:true,text:'Points',font:{size:9}},ticks:{font:{size:9}}}}}});
       individualTradeCharts.add(chart);
     }else{chartBox.className+=' muted';chartBox.textContent='No post-trade scoring weeks yet.';chartBox.style.display='grid';chartBox.style.placeItems='center';chartBox.style.fontSize='12px';}
     layout.append(chartBox);card.append(layout);area.append(card);
