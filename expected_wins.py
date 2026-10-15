@@ -94,14 +94,11 @@ def _raw_trade_transactions(league, week):
             except (TypeError, ValueError):
                 pass
         normalized = dict(raw)
-        if not normalized.get("status"):
-            # A TRADE_ACCEPT row with an acceptance/process timestamp is a
-            # completed deal; rows without either marker remain untrusted.
-            if normalized.get("processDate") or normalized.get("acceptedDate"):
-                normalized["status"] = "EXECUTED"
-            else:
-                malformed_rows += 1
-                continue
+        # Missing status is not proof that a proposed trade was completed.
+        # Keep its timestamp for matching, but do not turn it into a trade.
+        if str(normalized.get("status", "")).upper() != "EXECUTED":
+            malformed_rows += 1
+            continue
         try:
             transactions.append(transaction_class(
                 normalized, league.player_map, league.get_team_data
@@ -204,71 +201,6 @@ def _activity_trade_rows(league, date_weeks):
     return list(trades.values()), unmatched_dates
 
 
-def _roster_history_trade_rows(league, trade_weeks):
-    """Infer reciprocal player transfers from ESPN's historical roster snapshots.
-
-    This is a fallback for trade weeks where ESPN returns a TRADE_ACCEPT row
-    but hides its item list. A roster ownership change in both directions
-    between the same two teams in that scoring period identifies the deal.
-    """
-    cache = {}
-
-    def roster_owners(week):
-        if week not in cache:
-            data = league.espn_request.league_get(
-                params={"view": "mRoster", "scoringPeriodId": week}
-            )
-            owners = {}
-            for team in data.get("teams", []) or []:
-                team_id = str(team.get("id"))
-                roster = team.get("roster") or {}
-                entries = roster.get("entries", []) if isinstance(roster, dict) else []
-                for entry in entries:
-                    pool = entry.get("playerPoolEntry") or {}
-                    player = pool.get("player") or entry.get("player") or {}
-                    player_id = player.get("id")
-                    if player_id is not None:
-                        owners[str(player_id)] = team_id
-            cache[week] = owners
-        return cache[week]
-
-    inferred = []
-    for week in sorted(trade_weeks):
-        if week < 1:
-            continue
-        try:
-            before = roster_owners(week - 1)
-            after = roster_owners(week)
-        except Exception as exc:
-            print(f"Could not read roster history for trade week {week}: {exc}")
-            continue
-        moved = defaultdict(list)
-        for player_id, old_team in before.items():
-            new_team = after.get(player_id)
-            if new_team and new_team != old_team:
-                moved[(old_team, new_team)].append(int(player_id))
-
-        pairs = set()
-        for (from_id, to_id), player_ids in moved.items():
-            if (to_id, from_id) in moved:
-                pairs.add(tuple(sorted((from_id, to_id))))
-        for team_a, team_b in sorted(pairs):
-            legs = ([{"id": pid, "from": team_a, "to": team_b} for pid in moved[(team_a, team_b)]]
-                    + [{"id": pid, "from": team_b, "to": team_a} for pid in moved[(team_b, team_a)]])
-            if not legs:
-                continue
-            legs.sort(key=lambda leg: (leg["id"], leg["from"], leg["to"]))
-            trade_id = f"roster:{week}:{team_a}:{team_b}:" + ",".join(str(leg["id"]) for leg in legs)
-            inferred.append({
-                "id": trade_id,
-                "week": int(week),
-                "date_ms": 0,
-                "legs": legs,
-                "participants": [team_a, team_b],
-            })
-    return inferred
-
-
 def _current_rosters(league):
     result = {}
     for team in league.teams:
@@ -301,12 +233,9 @@ def _trade_data(league, team_names, completed_week):
     warning = ""
     malformed_weeks = []
     date_weeks = defaultdict(list)
-    trade_weeks = set()
     for week in range(1, max(league.current_week, 1) + 1):
         try:
             transactions, malformed_rows, trade_dates, found_trade = _raw_trade_transactions(league, week)
-            if found_trade:
-                trade_weeks.add(week)
             date_weeks[week].extend(trade_dates)
             if malformed_rows:
                 malformed_weeks.append(week)
@@ -367,25 +296,6 @@ def _trade_data(league, team_names, completed_week):
         warning = "ESPN's league activity feed could not be read; only trade details returned by its transaction endpoint are shown."
         print(f"League-wide trade activity unavailable: {exc}")
 
-    try:
-        roster_trades = _roster_history_trade_rows(league, trade_weeks)
-        for trade in roster_trades:
-            existing = next((item for item in raw_trades.values()
-                             if item["week"] == trade["week"]
-                             and set(item["participants"]) == set(trade["participants"])), None)
-            if existing is None:
-                raw_trades[trade["id"]] = trade
-                continue
-            existing_legs = {(leg["id"], leg["from"], leg["to"]) for leg in existing["legs"]}
-            for leg in trade["legs"]:
-                signature = (leg["id"], leg["from"], leg["to"])
-                if signature not in existing_legs:
-                    existing["legs"].append(leg)
-                    existing_legs.add(signature)
-    except Exception as exc:
-        warning = (warning + " " if warning else "") + "ESPN historical roster data could not be used to fill missing trade movements."
-        print(f"Historical roster trade recovery unavailable: {exc}")
-
     player_ids = sorted({leg["id"] for trade in raw_trades.values() for leg in trade["legs"]})
     player_data = {}
     if player_ids:
@@ -411,12 +321,15 @@ def _trade_data(league, team_names, completed_week):
             p = player_data.get(str(leg["id"]))
             name = str(getattr(p, "name", league.player_map.get(leg["id"], f"Player {leg['id']}")))
             points_after = 0.0
+            weekly_points = {}
             if p is not None:
                 stats = getattr(p, "stats", {}) or {}
                 for scored_week in range(trade["week"] + 1, completed_week + 1):
-                    weekly_points = _safe_float((stats.get(scored_week) or stats.get(str(scored_week)) or {}).get("points"))
-                    points_after += weekly_points
-            moved = {"id": leg["id"], "name": name, "points": round(points_after, 2)}
+                    week_points = _safe_float((stats.get(scored_week) or stats.get(str(scored_week)) or {}).get("points"))
+                    weekly_points[str(scored_week)] = round(week_points, 2)
+                    points_after += week_points
+            moved = {"id": leg["id"], "name": name, "points": round(points_after, 2),
+                     "weekly_points": weekly_points}
             by_team[leg["to"]]["incoming"].append(moved)
             by_team[leg["from"]]["outgoing"].append(moved)
 
@@ -424,6 +337,16 @@ def _trade_data(league, team_names, completed_week):
         for tid, side in by_team.items():
             incoming_pts = sum(p["points"] for p in side["incoming"])
             outgoing_pts = sum(p["points"] for p in side["outgoing"])
+            side["weekly_points"] = []
+            for scored_week in range(trade["week"] + 1, completed_week + 1):
+                incoming_week = sum(p["weekly_points"].get(str(scored_week), 0.0) for p in side["incoming"])
+                outgoing_week = sum(p["weekly_points"].get(str(scored_week), 0.0) for p in side["outgoing"])
+                side["weekly_points"].append({
+                    "week": scored_week,
+                    "incoming": round(incoming_week, 2),
+                    "outgoing": round(outgoing_week, 2),
+                    "net": round(incoming_week - outgoing_week, 2),
+                })
             side.update({
                 "incoming_points": round(incoming_pts, 2),
                 "outgoing_points": round(outgoing_pts, 2),
@@ -578,7 +501,7 @@ def _html(payload):
 <style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}</style>
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
 </style></head><body><main class="wrap">
 <h1>Fielding of (football) dreams</h1><div class="sub" id="subtitle"></div>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
@@ -600,7 +523,7 @@ def _html(payload):
 </section>
 
 <section class="panel" id="panel-trades" role="tabpanel">
-<article class="card"><h2>Trades by team</h2><p>Every completed trade involving the selected team, with incoming and outgoing players, points earned after the trade, and an individual trade rating.</p><div class="toolbar"><span>Team:</span><div id="tradeTeams" class="team-buttons" aria-label="Choose team"></div><span id="teamRating"></span></div><div id="tradeNotice" class="notice" style="display:none"></div><div id="teamTrades"></div></article>
+<article class="card"><h2>Trades by team</h2><p>Accepted trades involving the selected team, with post-trade player points and an individual trade rating.</p><div class="toolbar"><span>Team:</span><div id="tradeTeams" class="team-buttons" aria-label="Choose team"></div><span id="teamRating"></span></div><div id="tradeNotice" class="notice" style="display:none"></div><h3 id="teamTradeTitle"></h3><div class="team-trade-chart"><canvas id="teamTradeChart"></canvas></div><div id="teamTrades"></div></article>
 <article class="card"><h2>Trade calculator</h2><p>Choose players from two rosters. The estimate compares their projected remaining season points from ESPN.</p><div class="trade-grid"><div><label for="calcTeamA">Your team</label><select id="calcTeamA"></select><label for="givePlayers">Players you give</label><select class="player-select" id="givePlayers" multiple></select></div><div><label for="calcTeamB">Other team</label><select id="calcTeamB"></select><label for="getPlayers">Players you receive</label><select class="player-select" id="getPlayers" multiple></select></div></div><div class="toolbar"><button id="calcTrade">Evaluate trade</button></div><div id="calcResult" class="calculator-result"></div></article>
 </section>
 <div class="sub" id="updated"></div>
@@ -635,8 +558,40 @@ fillLiveWeeks();loadLive();
 
 const ratingByTeam=new Map(D.trade_ratings.map(r=>[r.team_id,r]));const teamIdByName=new Map(D.teams.map(n=>[n,D.roster_team_ids[n]]));
 function ratingClass(label){return label==='GM of the Year'?'gm':label==='Fleeced'?'fleeced':'inmix';}
-function renderTrades(selected){const tid=teamIdByName.get(selected);const rating=ratingByTeam.get(String(tid));const badge=document.getElementById('teamRating');badge.className='badge '+ratingClass(rating?.rating||'');badge.textContent=rating?`${rating.rating} · Net ${rating.score.toFixed(2)} pts/week · ${rating.wins} wins / ${rating.losses} losses`:'No rating yet';const area=document.getElementById('teamTrades');area.replaceChildren();const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No trade records are available for this team.';area.append(p);return;}list.sort((a,b)=>b.week-a.week).forEach(t=>{const side=t.sides.find(s=>s.team===selected);const card=document.createElement('div');card.className='trade-card';const h=document.createElement('h3');const title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>s.team).join(' ↔ ')}`;const tradeBadge=document.createElement('span');tradeBadge.className='badge trade-rating '+ratingClass(side.rating);tradeBadge.textContent=side.rating;h.append(title,tradeBadge);const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;card.append(h,meta,score);area.append(card)});}
-document.getElementById('tradeNotice').textContent=D.trade_warning;document.getElementById('tradeNotice').style.display=D.trade_warning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
+const teamTradeChart=new Chart(document.getElementById('teamTradeChart'),{type:'line',data:{labels:[],datasets:[{label:'Received − sent',data:[],borderColor:colors[0],backgroundColor:'rgba(77,163,255,.12)',fill:false,borderWidth:2.5,pointRadius:3,tension:.2}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},interaction:{mode:'index',intersect:false},scales:{y:{title:{display:true,text:'Fantasy points'},ticks:{precision:1}},x:{title:{display:true,text:'Week'}}}}});
+const individualTradeCharts=new Set();
+function renderTrades(selected){
+  const tid=teamIdByName.get(selected),rating=ratingByTeam.get(String(tid));
+  const badge=document.getElementById('teamRating');badge.className='badge '+ratingClass(rating?.rating||'');
+  badge.textContent=rating?`${rating.rating} · Net ${rating.score.toFixed(2)} pts/week · ${rating.wins} wins / ${rating.losses} losses`:'No rating yet';
+  const area=document.getElementById('teamTrades');
+  individualTradeCharts.forEach(chart=>chart.destroy());individualTradeCharts.clear();area.replaceChildren();
+  const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));
+  const weekCount=Math.max(0,Number(D.completed_week)||0),weeklyNet=new Map(Array.from({length:weekCount},(_,i)=>[i+1,0]));
+  list.forEach(t=>{const side=t.sides.find(s=>s.team===selected);(side.weekly_points||[]).forEach(row=>weeklyNet.set(Number(row.week),(weeklyNet.get(Number(row.week))||0)+Number(row.net||0)));});
+  document.getElementById('teamTradeTitle').textContent=`${selected} · received players minus sent players by week`;
+  teamTradeChart.data.labels=[...weeklyNet.keys()].map(w=>'W'+w);
+  teamTradeChart.data.datasets[0].data=[...weeklyNet.values()];teamTradeChart.update();
+  if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No accepted trade records are available for this team.';area.append(p);return;}
+  list.sort((a,b)=>b.week-a.week).forEach(t=>{
+    const side=t.sides.find(s=>s.team===selected),card=document.createElement('div');card.className='trade-card';
+    const layout=document.createElement('div');layout.className='trade-card-layout';
+    const info=document.createElement('div');info.className='trade-card-info';
+    const h=document.createElement('h3'),title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>s.team).join(' ↔ ')}`;
+    const tradeBadge=document.createElement('span');tradeBadge.className='badge trade-rating '+ratingClass(side.rating);tradeBadge.textContent=side.rating;h.append(title,tradeBadge);
+    const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;
+    const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;
+    info.append(h,meta,score);layout.append(info);
+    const chartBox=document.createElement('div');chartBox.className='trade-mini-chart';
+    const rows=side.weekly_points||[];
+    if(rows.length){
+      const canvas=document.createElement('canvas');chartBox.append(canvas);
+      const chart=new Chart(canvas,{type:'line',data:{labels:rows.map(r=>'W'+r.week),datasets:[{label:'Received players',data:rows.map(r=>r.incoming),borderColor:colors[0],pointRadius:2,borderWidth:2,tension:.2},{label:'Sent players',data:rows.map(r=>r.outgoing),borderColor:colors[1],pointRadius:2,borderWidth:2,tension:.2}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}},tooltip:{mode:'index',intersect:false}},interaction:{mode:'index',intersect:false},scales:{x:{ticks:{font:{size:9},maxRotation:0}},y:{beginAtZero:true,title:{display:true,text:'Points',font:{size:9}},ticks:{font:{size:9}}}}}});
+      individualTradeCharts.add(chart);
+    }else{chartBox.className+=' muted';chartBox.textContent='No post-trade scoring weeks yet.';chartBox.style.display='grid';chartBox.style.placeItems='center';chartBox.style.fontSize='12px';}
+    layout.append(chartBox);card.append(layout);area.append(card);
+  });
+}document.getElementById('tradeNotice').textContent=D.trade_warning;document.getElementById('tradeNotice').style.display=D.trade_warning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
 function populatePlayers(teamSelect,playersSelect){const team=teamSelect.value;const players=D.rosters[teamIdByName.get(team)]||[];playersSelect.replaceChildren(...players.map(p=>{const o=document.createElement('option');o.value=p.id;o.textContent=`${p.name} (${p.position}) · ${p.projected_remaining.toFixed(1)} projected remaining`;o.dataset.points=p.projected_remaining;return o;}));}const calcA=document.getElementById('calcTeamA'),calcB=document.getElementById('calcTeamB'),give=document.getElementById('givePlayers'),get=document.getElementById('getPlayers');calcA.addEventListener('change',()=>populatePlayers(calcA,give));calcB.addEventListener('change',()=>populatePlayers(calcB,get));populatePlayers(calcA,give);populatePlayers(calcB,get);document.getElementById('calcTrade').addEventListener('click',()=>{const a=[...give.selectedOptions].reduce((s,o)=>s+Number(o.dataset.points),0);const b=[...get.selectedOptions].reduce((s,o)=>s+Number(o.dataset.points),0);const d=b-a;document.getElementById('calcResult').textContent=`You give ${a.toFixed(1)} projected points and receive ${b.toFixed(1)}. Estimated rest-of-season difference: ${d>=0?'+':''}${d.toFixed(1)} points ${d>0?'in your favor':d<0?'against you':'— even'}.`;});
 
 // Snapshot refresh: the workflow publishes at five-minute intervals.
