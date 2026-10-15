@@ -1,19 +1,30 @@
-# ESPN Fantasy Expected Wins Dashboard
+# Fantasy dashboard update
 
-This package adapts the supplied `expected_wins_2026.py` into a public GitHub Pages dashboard. GitHub Actions polls the public ESPN league on a five-minute schedule, saves a live matchup probability snapshot, rebuilds the dashboard, and deploys it. Viewers' browsers also check for a newer score history once a minute.
+This package updates the ESPN Fantasy dashboard with four tabs:
 
-The live win probability is an estimate. It combines each matchup's current team score with ESPN's projected points for starters whose NFL games are not marked complete, then runs a simple simulation. ESPN score publication and GitHub scheduled workflow timing affect how quickly updates appear. GitHub documents a five-minute minimum interval for scheduled workflows, and says scheduled runs can be delayed.
+- **Team Stats**: season position radars, per-team weekly position bars, and per-team weekly drafted/traded/waivers point bars. Unrecognized acquisition types are shown separately as **Unknown**.
+- **Luck**: cumulative expected vs. actual wins, weekly expected-win heatmap, and league schedule-luck ranking.
+- **Live Win %**: matchup win-probability histories with a week picker. Snapshots are appended by GitHub Actions every five minutes and the page checks for fresh data once per minute.
+- **Trades**: completed trade ledger, realized points and points per week for each side, team ratings, and an ESPN-projection trade calculator.
 
-## Publish the link
+The live probability and trade calculator are estimates. Win probability uses a simple simulation of remaining ESPN projections. The trade calculator compares projected remaining season points. Trade impact counts players' actual fantasy points in scoring weeks after the trade week.
 
-1. Create a **public** GitHub repository and upload all files in this folder, including the `.github/workflows/publish.yml` workflow.
-2. In the repository, open **Settings > Pages** and set the build and deployment source to **GitHub Actions**.
-3. Open **Actions > Update and publish fantasy dashboard** and choose **Run workflow** once. The first run builds the initial site; scheduled runs then update it every five minutes.
-4. GitHub shows the public URL under **Settings > Pages**. Share that URL with the league.
+## Update the existing repository
 
-The repository must be public for the source and snapshot JSON to be public. Do not add ESPN cookies or account credentials; the supplied script identifies the league as public and the workflow uses no private credentials.
+Copy these files into the root of `FantasyFootballCope`, replacing the existing files with the same names. Put `publish.yml` under `.github/workflows/` (not the repository root). Keep old `live_week_*.json` files so the Live Win % tab retains prior-week snapshots.
 
-## Local preview
+In the repository's **Settings > Pages**, set the source to **GitHub Actions**. The workflow publishes on pushes, manual runs, and on a five-minute schedule.
+
+## ESPN secrets for the trade log
+
+The basic dashboard reads the public league. ESPN can restrict complete transaction history, so add these as **repository Actions secrets** if trade records are missing:
+
+- `ESPN_S2`
+- `SWID`
+
+In GitHub: **Settings > Secrets and variables > Actions > New repository secret**. Paste each value directly into GitHub's secret form. Do not put cookie values in the repository, in this chat, or in a public file. The workflow passes them to Python as environment variables and does not print them.
+
+## Local run
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -21,4 +32,4 @@ python live_logger.py
 python expected_wins.py
 ```
 
-Open `xwins_dashboard_2026.html` in a browser. The script also writes weekly and season CSV summaries.
+Open `index.html` in a browser. For trade history, set `ESPN_S2` and `SWID` in the local shell before running.
