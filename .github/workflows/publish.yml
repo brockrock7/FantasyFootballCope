@@ -1,6 +1,8 @@
 name: Update and publish fantasy dashboard
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
@@ -17,6 +19,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ESPN_S2: ${{ secrets.ESPN_S2 }}
+      SWID: ${{ secrets.SWID }}
     steps:
       - name: Check out dashboard and saved snapshots
         uses: actions/checkout@v4
@@ -35,7 +40,7 @@ jobs:
       - name: Collect live scores and probability snapshot
         run: python live_logger.py
 
-      - name: Build season dashboard
+      - name: Build the four-tab dashboard
         run: python expected_wins.py
 
       - name: Save updated live history
@@ -51,7 +56,7 @@ jobs:
       - name: Prepare Pages site
         run: |
           mkdir -p site
-          cp xwins_dashboard_2026.html site/index.html
+          cp index.html site/index.html
           cp live_week_*.json site/ 2>/dev/null || true
           touch site/.nojekyll
 
