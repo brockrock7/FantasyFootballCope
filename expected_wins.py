@@ -461,6 +461,89 @@ def _build_payload(league):
     season_by_team = {r["team"]: r for r in season}
     season.sort(key=lambda r: (r["team"].lower() != "league manager", -r["xw"], r["team"].lower()))
 
+    weekly_results = {name: [] for name in labels}
+    team_records = {}
+    if not completed.empty:
+        for name, group in completed.groupby("team"):
+            ordered = group.sort_values("week")
+            wins = int((ordered["actual"] == 1).sum())
+            ties = int((ordered["actual"] == 0.5).sum())
+            losses = int(len(ordered) - wins - ties)
+            points_for = float(ordered["score"].sum())
+            points_against = float(ordered["opp"].sum())
+            games = int(len(ordered))
+            team_records[name] = {
+                "team": name, "wins": wins, "losses": losses, "ties": ties,
+                "games": games, "pct": (wins + 0.5 * ties) / games if games else 0.0,
+                "points_for": points_for, "points_against": points_against,
+                "point_diff": points_for - points_against,
+            }
+            weekly_results[name] = [{
+                "week": int(row.week), "points_for": round(float(row.score), 2),
+                "points_against": round(float(row.opp), 2),
+                "point_diff": round(float(row.score - row.opp), 2),
+                "outcome": "W" if row.actual == 1 else ("L" if row.actual == 0 else "T"),
+            } for row in ordered.itertuples()]
+
+    for name in labels:
+        team_records.setdefault(name, {
+            "team": name, "wins": 0, "losses": 0, "ties": 0, "games": 0,
+            "pct": 0.0, "points_for": 0.0, "points_against": 0.0, "point_diff": 0.0,
+        })
+    leader = min(team_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower()))
+    standings = []
+    for record in sorted(team_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower())):
+        standings.append({**record, "games_back": round(((leader["wins"] - record["wins"]) + (record["losses"] - leader["losses"])) / 2, 1)})
+
+    recent_rows = {}
+    for name in labels:
+        team_rows = completed[completed["team"] == name].sort_values("week").tail(3) if not completed.empty else pd.DataFrame()
+        recent_rows[name] = team_rows
+    recent_points = {
+        name: float(rows["score"].mean()) if not rows.empty else 0.0
+        for name, rows in recent_rows.items()
+    }
+    recent_min = min(recent_points.values(), default=0.0)
+    recent_max = max(recent_points.values(), default=0.0)
+    power_rankings = []
+    for name in labels:
+        recent = recent_rows[name]
+        recent_wins = int((recent["actual"] == 1).sum()) if not recent.empty else 0
+        recent_ties = int((recent["actual"] == 0.5).sum()) if not recent.empty else 0
+        recent_games = len(recent)
+        recent_pct = (recent_wins + 0.5 * recent_ties) / recent_games if recent_games else 0.0
+        scoring_score = ((recent_points[name] - recent_min) / (recent_max - recent_min)) if recent_max > recent_min else 0.5
+        overall_pct = team_records[name]["pct"]
+        score = 100 * (0.40 * overall_pct + 0.35 * recent_pct + 0.25 * scoring_score)
+        power_rankings.append({
+            "team": name, "score": round(score, 2), "overall_pct": round(overall_pct, 3),
+            "recent_wins": recent_wins, "recent_losses": recent_games - recent_wins - recent_ties,
+            "recent_ties": recent_ties, "recent_games": recent_games,
+            "recent_points": round(recent_points[name], 2),
+        })
+    power_rankings.sort(key=lambda r: (-r["score"], r["team"].lower()))
+    for rank, record in enumerate(power_rankings, 1):
+        record["rank"] = rank
+
+    # Reward wins over high-scoring opponents; penalize losses to opponents
+    # who scored well below that week's league average. Normalize each result
+    # by that week's scoring spread so weeks remain comparable.
+    clutch_scores = defaultdict(float)
+    if not completed.empty:
+        league_by_week = completed.groupby("week")["score"].agg(["mean", "std"])
+        for row in completed.itertuples():
+            avg = float(league_by_week.loc[row.week, "mean"])
+            spread = float(league_by_week.loc[row.week, "std"])
+            z = (float(row.opp) - avg) / (spread if spread > 0 else 1.0)
+            if row.actual == 1:
+                clutch_scores[row.team] += max(z, 0.0)
+            elif row.actual == 0:
+                clutch_scores[row.team] -= max(-z, 0.0)
+    clutch_rankings = [{"team": name, "rating": round(clutch_scores[name], 3)} for name in labels]
+    clutch_rankings.sort(key=lambda r: (-r["rating"], r["team"].lower()))
+    for rank, record in enumerate(clutch_rankings, 1):
+        record["rank"] = rank
+
     weeks_for_stats = list(range(1, max_week + 1))
     weekly_positions = {
         name: [{"week": w, **{g: round(position_week[name][w][g], 2) for g in GROUPS}} for w in weeks_for_stats]
@@ -481,6 +564,8 @@ def _build_payload(league):
         "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS,
         "current_week": int(league.current_week), "completed_week": completed_week,
         "weeks": weeks_for_stats, "season": season, "heat": heat,
+        "standings": standings, "weekly_results": weekly_results,
+        "power_rankings": power_rankings, "clutch_rankings": clutch_rankings,
         "position_totals": {name: position_totals[name] for name in labels},
         "weekly_positions": weekly_positions,
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
@@ -498,24 +583,33 @@ def _html(payload):
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expected Wins - Fantasy League Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}</style>
+<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view{display:none}.league-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}.standings-value{font-weight:700}</style>
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
 </style></head><body><main class="wrap">
 <h1>Fielding of (football) dreams</h1><div class="sub" id="subtitle"></div>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
-<button class="tab active" data-tab="team" role="tab" aria-selected="true">Team Stats</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button></nav>
+<button class="tab active" data-tab="team" role="tab" aria-selected="true">Team Stats</button><button class="tab" data-tab="league" role="tab" aria-selected="false">League Stats</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button></nav>
 
 <section class="panel active" id="panel-team" role="tabpanel">
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
+<article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
+<article class="card"><h2>Overall Win/Loss Differential</h2><p>Each team's combined point differential in wins is above zero in green; their point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
+</section>
+
+<section class="panel" id="panel-league" role="tabpanel">
+<div class="subtabs" role="tablist" aria-label="League statistics"><button class="subtab active" type="button" data-league-view="standings" aria-selected="true">Standings</button><button class="subtab" type="button" data-league-view="power" aria-selected="false">Power Rankings</button></div>
+<section class="league-view active" id="league-view-standings"><article class="card"><h2>League Standings</h2><p>Completed regular-season record, points for, points against, and point differential. Points columns use a red-to-green scale centered on the league average.</p><div class="scroll"><table id="standingsTable"></table></div></article></section>
+<section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><p>Composite ranking: 40% overall win rate, 35% win rate over the last three completed weeks, and 25% recent scoring compared with the league. Fewer than three completed weeks use all available weeks.</p><div class="chartbox"><canvas id="powerChart"></canvas></div><div class="scroll"><table id="powerTable"></table></div></article></section>
 </section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
 <article class="card"><h2>Expected wins and actual wins</h2><p>Expected wins compare each team's score with every other team that week. The shaded gap shows schedule luck.</p><div class="toolbar"><span>Team:</span><div id="luckTeams" class="team-buttons" aria-label="Choose team"></div><span id="luckNote" class="muted"></span></div><div class="chartbox"><canvas id="luckLine"></canvas></div></article>
 <article class="card"><h2>Schedule luck (actual wins minus expected wins)</h2><p>Positive means a team won more often than its points would predict against the league; negative means fewer.</p><div class="chartbox"><canvas id="luckBars"></canvas></div></article>
 <article class="card"><h2>Weekly expected win share</h2><p>Each cell is the share of league teams outscored that week. 1.00 is the top score.</p><div class="scroll"><table id="heat"></table></div></article>
+<article class="card"><h2>Clutch Rating</h2><p>Rewards wins over opponents who score above that week's league average and penalizes losses to opponents who score below it. Opponent scoring differences are normalized to each week's scoring spread.</p><div class="chartbox"><canvas id="clutchChart"></canvas></div></article>
 </section>
 
 <section class="panel" id="panel-live" role="tabpanel">
@@ -545,9 +639,32 @@ D.teams.forEach((team,i)=>{const cell=document.createElement('div');cell.classNa
 const posChart=new Chart(document.getElementById('positionChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.groups.map((g,i)=>({label:g,data:[],backgroundColor:colors[i]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=t;posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[D.groups[i]]||0));posChart.update();}
 const positionButtons=fillTeamButtons('positionTeams',showPosition);
+const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
+function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+team;differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
+const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
+const winDiffTotals=D.teams.map(team=>(D.weekly_results[team]||[]).filter(row=>row.outcome==='W').reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0));
+const lossDiffTotals=D.teams.map(team=>(D.weekly_results[team]||[]).filter(row=>row.outcome==='L').reduce((sum,row)=>sum-Math.abs(Number(row.point_diff)||0),0));
+const overallDiffBound=Math.max(1,...winDiffTotals.map(Math.abs),...lossDiffTotals.map(Math.abs));
+new Chart(document.getElementById('overallDifferentialChart'),{type:'bar',data:{labels:D.teams,datasets:[{label:'Point differential in wins',data:winDiffTotals,backgroundColor:'#3fb950',borderRadius:3,stack:'differential'},{label:'Point differential in losses',data:lossDiffTotals,backgroundColor:'#f85149',borderRadius:3,stack:'differential'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'}},scales:{x:{stacked:true,ticks:{maxRotation:45,minRotation:0}},y:{stacked:true,min:-overallDiffBound,max:overallDiffBound,title:{display:true,text:'Point differential'},ticks:{precision:0}}}}});
+
+const standingsTable=document.getElementById('standingsTable');
+function appendTableHeader(table,labels){const tr=document.createElement('tr');labels.forEach(label=>{const th=document.createElement('th');th.textContent=label;tr.append(th);});table.append(tr);}
+appendTableHeader(standingsTable,['Rank','Team','W','L','T','PCT','GB','PF','PA','DIFF']);
+function colorByLeagueAverage(value,values){const avg=values.reduce((sum,v)=>sum+v,0)/(values.length||1),lo=Math.min(...values,avg),hi=Math.max(...values,avg),red=[248,81,73],yellow=[245,214,108],green=[63,185,80];let a,b,t;if(value<=avg){a=red;b=yellow;t=avg===lo?1:(value-lo)/(avg-lo);}else{a=yellow;b=green;t=hi===avg?1:(value-avg)/(hi-avg);}t=Math.max(0,Math.min(1,t));return 'rgb('+a.map((channel,i)=>Math.round(channel+(b[i]-channel)*t)).join(',')+')';}
+const pointMetrics=['points_for','points_against','point_diff'],metricValues=Object.fromEntries(pointMetrics.map(key=>[key,D.standings.map(row=>Number(row[key]||0))]));
+D.standings.forEach((row,index)=>{const tr=document.createElement('tr');[index+1,row.team,row.wins,row.losses,row.ties,row.pct.toFixed(3),row.games_back===0?'—':row.games_back.toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});pointMetrics.forEach(key=>{const td=document.createElement('td');const value=Number(row[key]||0);td.className='standings-value';td.textContent=value.toFixed(1);td.style.color=colorByLeagueAverage(value,metricValues[key]);tr.append(td);});standingsTable.append(tr);});
+
+const powerByTeam=new Map(D.power_rankings.map(row=>[row.team,row]));
+const powerChart=new Chart(document.getElementById('powerChart'),{type:'bar',data:{labels:D.power_rankings.map(r=>r.team),datasets:[{label:'Power score',data:D.power_rankings.map(r=>r.score),backgroundColor:'#4da3ff',borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{y:{reverse:true},x:{beginAtZero:true,max:100,title:{display:true,text:'Power score (0-100)'}}}}});
+const powerTable=document.getElementById('powerTable');appendTableHeader(powerTable,['Rank','Team','Score','Overall record','Last 3 weeks','Recent PPG']);
+D.power_rankings.forEach(row=>{const record=D.standings.find(r=>r.team===row.team);const tr=document.createElement('tr');[row.rank,row.team,row.score.toFixed(1),`${record.wins}-${record.losses}-${record.ties}`,`${row.recent_wins}-${row.recent_losses}-${row.recent_ties}`,row.recent_points.toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});powerTable.append(tr);});
+document.querySelectorAll('.subtab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.subtab').forEach(other=>{const active=other===button;other.classList.toggle('active',active);other.setAttribute('aria-selected',String(active));});document.querySelectorAll('.league-view').forEach(view=>view.classList.toggle('active',view.id==='league-view-'+button.dataset.leagueView));requestAnimationFrame(()=>document.querySelectorAll('#panel-league.active canvas').forEach(canvas=>Chart.getChart(canvas)?.resize()));}));
+
 const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,max:Math.max(1,Number(D.completed_week)||0),title:{display:true,text:'Cumulative wins (maximum possible = completed weeks)'}}}}});
 function showLuck(team){const r=luckData.get(team);const weeks=r?.weeks||[];luckLine.options.plugins.title.text=team;luckLine.data.labels=['Start',...weeks.map(w=>'W'+w)];luckLine.data.datasets[0].data=[0,...(r?.cum_xw||[])];luckLine.data.datasets[1].data=[0,...(r?.cum_actual||[])];luckLine.update();document.getElementById('luckNote').textContent=r?`Actual ${r.actual.toFixed(1)} · Expected ${r.xw.toFixed(2)} · Luck ${r.luck>=0?'+':''}${r.luck.toFixed(2)} · Expected win rate ${(100*r.xwin_pct).toFixed(1)}%`:'';}const luckButtons=fillTeamButtons('luckTeams',showLuck);
 new Chart(document.getElementById('luckBars'),{type:'bar',data:{labels:D.season.map(r=>r.team),datasets:[{data:D.season.map(r=>r.luck),backgroundColor:D.season.map(r=>r.luck>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:'Actual wins − expected wins'}}}}});
+const clutchValues=D.clutch_rankings.map(row=>row.rating),clutchBound=Math.max(1,...clutchValues.map(value=>Math.abs(value)));
+new Chart(document.getElementById('clutchChart'),{type:'bar',data:{labels:D.clutch_rankings.map(row=>row.team),datasets:[{label:'Clutch rating',data:clutchValues,backgroundColor:clutchValues.map(value=>value>0?'#3fb950':value<0?'#f85149':'#a7b3c2'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{min:-clutchBound,max:clutchBound,title:{display:true,text:'Clutch rating (higher is better)'}},y:{reverse:true}}}});
 const heat=document.getElementById('heat');const hr=document.createElement('tr');['Team',...Array.from({length:D.completed_week},(_,i)=>'W'+(i+1)),'xW','Actual','Luck'].forEach(x=>{const c=document.createElement('th');c.textContent=x;hr.append(c)});heat.append(hr);D.teams.forEach(team=>{const tr=document.createElement('tr');const name=document.createElement('td');name.textContent=team;tr.append(name);(D.heat[team]||[]).forEach(v=>{const td=document.createElement('td');td.textContent=v==null?'—':v.toFixed(2);if(v!=null)td.style.background=`hsl(${120*v},65%,45%)`;tr.append(td)});const r=luckData.get(team)||{xw:0,actual:0,luck:0};[r.xw.toFixed(2),r.actual.toFixed(1),(r.luck>=0?'+':'')+r.luck.toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});heat.append(tr)});
 
 let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{labels:[],datasets:[{label:'',data:[],borderColor:colors[0],pointRadius:0,borderWidth:2.5},{label:'',data:[],borderColor:colors[1],pointRadius:0,borderWidth:2.5}]},options:{maintainAspectRatio:false,animation:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Win probability (%)'}},x:{ticks:{maxTicksLimit:10,maxRotation:0}}}}});
