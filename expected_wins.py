@@ -514,7 +514,7 @@ def _build_payload(league):
         recent_pct = (recent_wins + 0.5 * recent_ties) / recent_games if recent_games else 0.0
         scoring_score = ((recent_points[name] - recent_min) / (recent_max - recent_min)) if recent_max > recent_min else 0.5
         overall_pct = team_records[name]["pct"]
-        score = 100 * (0.40 * overall_pct + 0.35 * recent_pct + 0.25 * scoring_score)
+        score = 100 * (0.20 * overall_pct + 0.50 * recent_pct + 0.30 * scoring_score)
         power_rankings.append({
             "team": name, "score": round(score, 2), "overall_pct": round(overall_pct, 3),
             "recent_wins": recent_wins, "recent_losses": recent_games - recent_wins - recent_ties,
@@ -544,6 +544,37 @@ def _build_payload(league):
     for rank, record in enumerate(clutch_rankings, 1):
         record["rank"] = rank
 
+    # Use the in-progress regular-season scores as provisional results so the
+    # published playoff picture can move while games are being played.
+    bracket_records = {name: dict(record) for name, record in team_records.items()}
+    current_week = int(league.current_week)
+    regular_season_count = int(getattr(league.settings, "reg_season_count", 14))
+    bracket_live_week = None
+    if completed_week < current_week <= regular_season_count:
+        for row in score_rows:
+            if row["week"] != current_week or (row["score"] <= 0 and row["opp"] <= 0):
+                continue
+            bracket_live_week = current_week
+            record = bracket_records[row["team"]]
+            record["games"] += 1
+            record["points_for"] += row["score"]
+            record["points_against"] += row["opp"]
+            record["point_diff"] += row["score"] - row["opp"]
+            if row["score"] > row["opp"]:
+                record["wins"] += 1
+            elif row["score"] < row["opp"]:
+                record["losses"] += 1
+            else:
+                record["ties"] += 1
+            record["pct"] = (record["wins"] + 0.5 * record["ties"]) / record["games"]
+    bracket_records = sorted(bracket_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower()))
+    try:
+        playoff_team_count = max(0, min(len(labels), int(getattr(league.settings, "playoff_team_count", 0) or 0)))
+    except (TypeError, ValueError):
+        playoff_team_count = 0
+    playoff_teams = [{"seed": seed, "team": record["team"], "record": f'{record["wins"]}-{record["losses"]}-{record["ties"]}'}
+                     for seed, record in enumerate(bracket_records[:playoff_team_count], 1)]
+
     weeks_for_stats = list(range(1, max_week + 1))
     weekly_positions = {
         name: [{"week": w, **{g: round(position_week[name][w][g], 2) for g in GROUPS}} for w in weeks_for_stats]
@@ -566,6 +597,8 @@ def _build_payload(league):
         "weeks": weeks_for_stats, "season": season, "heat": heat,
         "standings": standings, "weekly_results": weekly_results,
         "power_rankings": power_rankings, "clutch_rankings": clutch_rankings,
+        "playoff_teams": playoff_teams, "playoff_team_count": playoff_team_count,
+        "bracket_live_week": bracket_live_week,
         "position_totals": {name: position_totals[name] for name in labels},
         "weekly_positions": weekly_positions,
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
@@ -583,7 +616,7 @@ def _html(payload):
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expected Wins - Fantasy League Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view{display:none}.league-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}.standings-value{font-weight:700}</style>
+<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view{display:none}.league-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}.standings-value{font-weight:700}.bracket-scroll{overflow-x:auto;padding:2px 0 10px}.bracket{display:flex;gap:16px;min-width:max-content;align-items:flex-start}.bracket-round{width:250px;display:flex;flex-direction:column;gap:12px}.bracket-round h3{font-size:14px;margin:0;color:var(--muted)}.bracket-match{border:1px solid var(--line);background:var(--bg);border-radius:10px;overflow:hidden}.bracket-side{padding:9px 11px;border-bottom:1px solid var(--line);font-size:13px}.bracket-side:last-child{border-bottom:0}.bracket-side.muted{color:var(--muted)}</style>
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
@@ -596,13 +629,14 @@ def _html(payload):
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
 <article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
-<article class="card"><h2>Overall Win/Loss Differential</h2><p>Each team's combined point differential in wins is above zero in green; their point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
+<article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
 </section>
 
 <section class="panel" id="panel-league" role="tabpanel">
 <div class="subtabs" role="tablist" aria-label="League statistics"><button class="subtab active" type="button" data-league-view="standings" aria-selected="true">Standings</button><button class="subtab" type="button" data-league-view="power" aria-selected="false">Power Rankings</button></div>
 <section class="league-view active" id="league-view-standings"><article class="card"><h2>League Standings</h2><p>Completed regular-season record, points for, points against, and point differential. Points columns use a red-to-green scale centered on the league average.</p><div class="scroll"><table id="standingsTable"></table></div></article></section>
-<section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><p>Composite ranking: 40% overall win rate, 35% win rate over the last three completed weeks, and 25% recent scoring compared with the league. Fewer than three completed weeks use all available weeks.</p><div class="chartbox"><canvas id="powerChart"></canvas></div><div class="scroll"><table id="powerTable"></table></div></article></section>
+<section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><p>Score weights: 20% overall win rate, 50% win rate over the last three completed weeks, and 30% recent points per game compared with the league. Fewer than three completed weeks use all available weeks.</p><div class="scroll"><table id="powerTable"></table></div></article></section>
+<article class="card"><h2>Playoff Bracket If the Season Ended Today</h2><p id="playoffBracketNote">Projected seeds use current standings, including live regular-season scores when available.</p><div id="playoffBracket" class="bracket-scroll"></div></article>
 </section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
@@ -642,8 +676,8 @@ const positionButtons=fillTeamButtons('positionTeams',showPosition);
 const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
 function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+team;differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
-const winDiffTotals=D.teams.map(team=>(D.weekly_results[team]||[]).filter(row=>row.outcome==='W').reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0));
-const lossDiffTotals=D.teams.map(team=>(D.weekly_results[team]||[]).filter(row=>row.outcome==='L').reduce((sum,row)=>sum-Math.abs(Number(row.point_diff)||0),0));
+const winDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='W');return rows.length?rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
+const lossDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='L');return rows.length?-rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
 const overallDiffBound=Math.max(1,...winDiffTotals.map(Math.abs),...lossDiffTotals.map(Math.abs));
 new Chart(document.getElementById('overallDifferentialChart'),{type:'bar',data:{labels:D.teams,datasets:[{label:'Point differential in wins',data:winDiffTotals,backgroundColor:'#3fb950',borderRadius:3,stack:'differential'},{label:'Point differential in losses',data:lossDiffTotals,backgroundColor:'#f85149',borderRadius:3,stack:'differential'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'}},scales:{x:{stacked:true,ticks:{maxRotation:45,minRotation:0}},y:{stacked:true,min:-overallDiffBound,max:overallDiffBound,title:{display:true,text:'Point differential'},ticks:{precision:0}}}}});
 
@@ -654,10 +688,34 @@ function colorByLeagueAverage(value,values){const avg=values.reduce((sum,v)=>sum
 const pointMetrics=['points_for','points_against','point_diff'],metricValues=Object.fromEntries(pointMetrics.map(key=>[key,D.standings.map(row=>Number(row[key]||0))]));
 D.standings.forEach((row,index)=>{const tr=document.createElement('tr');[index+1,row.team,row.wins,row.losses,row.ties,row.pct.toFixed(3),row.games_back===0?'—':row.games_back.toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});pointMetrics.forEach(key=>{const td=document.createElement('td');const value=Number(row[key]||0);td.className='standings-value';td.textContent=value.toFixed(1);td.style.color=colorByLeagueAverage(value,metricValues[key]);tr.append(td);});standingsTable.append(tr);});
 
-const powerByTeam=new Map(D.power_rankings.map(row=>[row.team,row]));
-const powerChart=new Chart(document.getElementById('powerChart'),{type:'bar',data:{labels:D.power_rankings.map(r=>r.team),datasets:[{label:'Power score',data:D.power_rankings.map(r=>r.score),backgroundColor:'#4da3ff',borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{y:{reverse:true},x:{beginAtZero:true,max:100,title:{display:true,text:'Power score (0-100)'}}}}});
-const powerTable=document.getElementById('powerTable');appendTableHeader(powerTable,['Rank','Team','Score','Overall record','Last 3 weeks','Recent PPG']);
-D.power_rankings.forEach(row=>{const record=D.standings.find(r=>r.team===row.team);const tr=document.createElement('tr');[row.rank,row.team,row.score.toFixed(1),`${record.wins}-${record.losses}-${record.ties}`,`${row.recent_wins}-${row.recent_losses}-${row.recent_ties}`,row.recent_points.toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});powerTable.append(tr);});
+const powerTable=document.getElementById('powerTable');appendTableHeader(powerTable,['Rank','Team','Score']);
+const powerScores=D.power_rankings.map(row=>row.score);
+D.power_rankings.forEach(row=>{const tr=document.createElement('tr');[row.rank,row.team,row.score.toFixed(1)].forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index===2){td.className='standings-value';td.style.color=colorByLeagueAverage(row.score,powerScores);}tr.append(td);});powerTable.append(tr);});
+const playoffBracket=document.getElementById('playoffBracket'),playoffNote=document.getElementById('playoffBracketNote');
+function renderPlayoffBracket(){
+  playoffBracket.replaceChildren();
+  playoffNote.textContent=D.bracket_live_week?`Includes in-progress Week ${D.bracket_live_week} scores; refreshes with dashboard updates.`:'Based on current standings; refreshes with dashboard updates.';
+  const entrants=D.playoff_teams||[];
+  if(!D.playoff_team_count||!entrants.length){const p=document.createElement('p');p.className='muted';p.textContent='ESPN does not report playoff teams for this league.';playoffBracket.append(p);return;}
+  let size=2;while(size<entrants.length)size*=2;
+  let seedOrder=[1,2];for(let n=4;n<=size;n*=2)seedOrder=seedOrder.flatMap(seed=>[seed,n+1-seed]);
+  const bySeed=new Map(entrants.map(row=>[row.seed,`#${row.seed} · ${row.team} (${row.record})`]));
+  let nodes=seedOrder.map(seed=>bySeed.get(seed)||null),roundIndex=0,gameNumber=1;const bracket=document.createElement('div');bracket.className='bracket';
+  while(nodes.length>1){
+    const matches=[],next=[];
+    for(let i=0;i<nodes.length;i+=2){
+      const left=nodes[i],right=nodes[i+1],number=gameNumber++;
+      const match={left:left||'BYE',right:right||'BYE',number};matches.push(match);
+      next.push(left&&!right?left:right&&!left?right:`Winner of Game ${number}`);
+    }
+    const round=document.createElement('div');round.className='bracket-round';const heading=document.createElement('h3');
+    heading.textContent=matches.length===1?'Championship':(roundIndex===0&&entrants.length<size?'First Round':matches.length===2?'Semifinals':matches.length===4?'Quarterfinals':`Round ${roundIndex+1}`);round.append(heading);
+    matches.forEach(match=>{const card=document.createElement('div');card.className='bracket-match';[match.left,match.right].forEach(label=>{const side=document.createElement('div');side.className='bracket-side'+(label==='BYE'||label.startsWith('Winner of')?' muted':'');side.textContent=label;card.append(side);});round.append(card);});
+    bracket.append(round);nodes=next;roundIndex++;
+  }
+  playoffBracket.append(bracket);
+}
+renderPlayoffBracket();
 document.querySelectorAll('.subtab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.subtab').forEach(other=>{const active=other===button;other.classList.toggle('active',active);other.setAttribute('aria-selected',String(active));});document.querySelectorAll('.league-view').forEach(view=>view.classList.toggle('active',view.id==='league-view-'+button.dataset.leagueView));requestAnimationFrame(()=>document.querySelectorAll('#panel-league.active canvas').forEach(canvas=>Chart.getChart(canvas)?.resize()));}));
 
 const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,max:Math.max(1,Number(D.completed_week)||0),title:{display:true,text:'Cumulative wins (maximum possible = completed weeks)'}}}}});
