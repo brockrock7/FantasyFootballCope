@@ -13,6 +13,9 @@ from espn_api.football import League
 LEAGUE_ID = 509033444
 YEAR = 2026
 SIMULATIONS = 5000
+# Wider per-player uncertainty than ESPN's point projection gives by itself.
+PLAYER_SD_MULTIPLIER = 0.90
+PLAYER_SD_FLOOR = 2.0
 ROOT = Path(__file__).resolve().parent
 
 
@@ -28,7 +31,9 @@ def _remaining_projection(lineup):
         remaining = max(0.0, projected - scored)
         if remaining:
             mean += remaining
-            sd = max(1.5, 0.65 * math.sqrt(remaining))
+            # Approximate each player's remaining score as Normal(R, s²),
+            # where R is the remaining projection and s = max(2, 0.90√R).
+            sd = max(PLAYER_SD_FLOOR, PLAYER_SD_MULTIPLIER * math.sqrt(remaining))
             variance += sd * sd
     return mean, variance
 
