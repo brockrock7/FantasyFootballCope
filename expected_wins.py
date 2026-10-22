@@ -27,7 +27,7 @@ MULTIVERSE_SIMULATIONS = 20000
 ROOT = Path(__file__).resolve().parent
 GROUPS = ["QB", "RB", "WR", "TE", "K", "DEF"]
 POSITIONS = {"QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE", "K": "K", "D/ST": "DEF"}
-SOURCES = ["Drafted", "Traded", "Waivers", "Unknown"]
+SOURCES = ["Drafted", "Traded", "Waivers"]
 SOURCE_MAP = {
     "DRAFT": "Drafted", "DRAFTED": "Drafted",
     "TRADE": "Traded", "TRADED": "Traded",
@@ -68,11 +68,45 @@ def _week_acquisition_sources(league, week):
             if player_id is None:
                 continue
             source = _source_bucket(entry.get("acquisitionType") or pool.get("acquisitionType") or player.get("acquisitionType"))
+            if source == "Unknown":
+                pending = [entry]
+                while pending and source == "Unknown":
+                    value = pending.pop()
+                    if isinstance(value, dict):
+                        for key, nested in value.items():
+                            if str(key).lower() in {"acquisitiontype", "acquisitionsource"}:
+                                source = _source_bucket(nested)
+                                if source != "Unknown":
+                                    break
+                            if isinstance(nested, (dict, list)):
+                                pending.append(nested)
+                    elif isinstance(value, list):
+                        pending.extend(value)
             if source != "Unknown":
                 player_id = int(player_id)
                 by_team_and_player[(team_id, player_id)] = source
                 by_player[player_id] = source
     return by_team_and_player, by_player
+
+
+def _drafted_player_teams(league):
+    """Read draft ownership from ESPN's mDraftDetail endpoint."""
+    drafted = set()
+    try:
+        data = league.espn_request.league_get(params={"view": "mDraftDetail"})
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        detail = data.get("draftDetail", {}) if isinstance(data, dict) else {}
+        for pick in detail.get("picks", []) or []:
+            try:
+                player_id, team_id = int(pick.get("playerId", -1)), str(pick.get("teamId", ""))
+            except (TypeError, ValueError):
+                continue
+            if player_id > 0 and team_id:
+                drafted.add((team_id, player_id))
+    except Exception as exc:
+        print(f"Could not read ESPN draft details; untagged non-trade adds will use the waiver fallback: {exc}")
+    return drafted
 
 
 def _round_robin_rounds(team_count, rng):
@@ -140,14 +174,13 @@ def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
         postseason_by_week[int(row["week"])][row["team"]] = float(row["score"])
     complete_weeks = [week for week in range(1, completed_week + 1)
                       if all(team in score_by_week[week] for team in labels)]
-    base_rounds = _round_robin_rounds(team_count, rng) if team_count > 1 else []
-    if not base_rounds:
+    round_count = team_count if team_count % 2 else team_count - 1
+    if team_count < 2:
         return {"simulations": 0, "weeks_used": [], "actual_wins": actual_wins,
                 "distributions": {}, "first_place_counts": {},
                 "playoff": {"semifinals_complete": False, "finals_complete": False,
                             "semifinal_matchups": {}, "final_matchups": {}, "champions": {}}}
-    repeats = max(0, regular_season_count - len(base_rounds))
-    schedule = base_rounds + [base_rounds[i % len(base_rounds)] for i in range(repeats)]
+    repeats = max(0, regular_season_count - round_count)
     division_by_name = {str(team.team_name): str(getattr(team, "division_id", None)) for team in teams}
     division_ids = [str(key) for key in getattr(league.settings, "division_map", {}).keys()]
     tie_rule = str(getattr(league.settings, "playoff_seed_tie_rule", "H2H_RECORD") or "H2H_RECORD")
@@ -161,6 +194,10 @@ def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
                                  if all(team in scores for team in labels)}
 
     for _ in range(MULTIVERSE_SIMULATIONS):
+        # Generate a fresh round-robin draw for every sample. Reusing one draw
+        # would make all 20,000 results identical and collapse the distributions.
+        base_rounds = _round_robin_rounds(team_count, rng)
+        schedule = base_rounds + [base_rounds[i % len(base_rounds)] for i in range(repeats)]
         wins, ties, games = [0] * team_count, [0] * team_count, [0] * team_count
         points_against = [0.0] * team_count
         div_wins, div_games = [0.0] * team_count, [0] * team_count
@@ -605,6 +642,20 @@ def _build_payload(league):
     max_week = min(max(current_week, 1), regular_season_count)
     completed_week = min(max(int(league.current_week) - 1, 0), max_week)
     current_rosters = _current_rosters(league)
+    drafted_player_teams = _drafted_player_teams(league)
+    trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
+    trade_acquisitions = defaultdict(list)
+    team_id_by_name = {name: team_id for team_id, name in team_names.items()}
+    for trade in trades:
+        for side in trade.get("sides", []):
+            team_id = team_id_by_name.get(side.get("team"))
+            if team_id is None:
+                continue
+            for player in side.get("incoming", []):
+                try:
+                    trade_acquisitions[(str(team_id), int(player["id"]))].append(int(trade["week"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
 
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
@@ -650,6 +701,17 @@ def _build_payload(league):
                         or id_only_source.get(player_id)
                         or _source_bucket(getattr(player, "acquisitionType", ""))
                     )
+                    if source == "Unknown":
+                        trade_weeks = trade_acquisitions.get((str(tid), player_id), [])
+                        if any(trade_week <= week for trade_week in trade_weeks):
+                            source = "Traded"
+                        elif (str(tid), player_id) in drafted_player_teams:
+                            source = "Drafted"
+                        else:
+                            # Once ESPN's direct tag, draft record, and accepted
+                            # trade history have been checked, an untagged roster
+                            # add is a waiver/free-agent acquisition.
+                            source = "Waivers"
                     source_week[name][week][source] += points
         if week > completed_week:
             continue
@@ -881,7 +943,6 @@ def _build_payload(league):
             continue
     live_weeks = sorted(set(live_weeks))
 
-    trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
     return {
         "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS, "sources": SOURCES,
         "current_week": int(league.current_week), "completed_week": completed_week,
@@ -924,7 +985,7 @@ def _html(payload):
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
 </section>
-<section class="team-view" id="team-view-acquisition"><article class="card"><h2>Weekly points by acquisition</h2><p>Starter points grouped by how each player joined that roster: drafted, traded for, or acquired through waivers/free agency. ESPN data that does not identify a source is shown as Unknown.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article></section>
+<section class="team-view" id="team-view-acquisition"><article class="card"><h2>Weekly points by acquisition</h2><p>Starter points are grouped using ESPN roster tags, draft picks, and accepted trade history. If ESPN omits an acquisition tag and neither the draft nor trade records identify it, the player is counted under waivers/free agency.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article></section>
 <section class="team-view" id="team-view-differential">
 <article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
 <article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
