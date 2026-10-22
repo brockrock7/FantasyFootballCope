@@ -9,8 +9,11 @@ require them for complete trade records. Never put cookie values in this file.
 from __future__ import annotations
 
 import json
+import math
 import os
 import importlib
+import random
+from collections import Counter
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,9 +23,19 @@ from espn_api.football import League
 
 LEAGUE_ID = 509033444
 YEAR = 2026
+MULTIVERSE_SIMULATIONS = 20000
 ROOT = Path(__file__).resolve().parent
 GROUPS = ["QB", "RB", "WR", "TE", "K", "DEF"]
 POSITIONS = {"QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE", "K": "K", "D/ST": "DEF"}
+SOURCES = ["Drafted", "Traded", "Waivers", "Unknown"]
+SOURCE_MAP = {
+    "DRAFT": "Drafted", "DRAFTED": "Drafted",
+    "TRADE": "Traded", "TRADED": "Traded",
+    "WAIVER": "Waivers", "WAIVERS": "Waivers", "WAIVER_WIRE": "Waivers",
+    "WAIVERS_TRADITIONAL": "Waivers", "WAIVERS_ROLLING": "Waivers",
+    "WAIVERS_FAAB": "Waivers", "FREE_AGENT": "Waivers",
+    "FREEAGENT": "Waivers", "FA": "Waivers",
+}
 
 
 def _safe_float(value):
@@ -30,6 +43,204 @@ def _safe_float(value):
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _source_bucket(value):
+    label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    return SOURCE_MAP.get(label, "Unknown")
+
+
+def _week_acquisition_sources(league, week):
+    """Read historical roster acquisition labels directly from ESPN."""
+    by_team_and_player = {}
+    by_player = {}
+    data = league.espn_request.league_get(params={"view": "mRoster", "scoringPeriodId": week})
+    for team in data.get("teams", []) if isinstance(data, dict) else []:
+        team_id = str(team.get("id", ""))
+        roster = team.get("roster") or {}
+        entries = roster.get("entries", []) if isinstance(roster, dict) else roster
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            pool = entry.get("playerPoolEntry") or {}
+            player = pool.get("player") or {}
+            player_id = entry.get("playerId") or pool.get("id") or player.get("id")
+            if player_id is None:
+                continue
+            source = _source_bucket(entry.get("acquisitionType") or pool.get("acquisitionType") or player.get("acquisitionType"))
+            if source != "Unknown":
+                player_id = int(player_id)
+                by_team_and_player[(team_id, player_id)] = source
+                by_player[player_id] = source
+    return by_team_and_player, by_player
+
+
+def _round_robin_rounds(team_count, rng):
+    order = list(range(team_count))
+    rng.shuffle(order)
+    if team_count % 2:
+        order.append(None)
+    rounds = []
+    for _ in range(len(order) - 1):
+        rounds.append([(order[i], order[-1 - i]) for i in range(len(order) // 2)
+                       if order[i] is not None and order[-1 - i] is not None])
+        order = [order[0], order[-1], *order[1:-1]]
+    return rounds
+
+
+def _multiverse_rank(metrics, h2h_points, h2h_games, division_ids, tie_rule, rng):
+    if tie_rule == "TOTAL_POINTS_SCORED":
+        hierarchy = ("win_pct", "points_for", "head_to_head", "division_pct", "points_against", "coin")
+    elif tie_rule == "INTRA_DIVISION_RECORD":
+        hierarchy = ("division_pct", "head_to_head", "win_pct", "points_for", "points_against", "coin")
+    else:
+        hierarchy = ("win_pct", "head_to_head", "points_for", "division_pct", "points_against", "coin")
+
+    def sort_group(indices, level=0):
+        if len(indices) < 2 or level >= len(hierarchy):
+            return indices
+        criterion = hierarchy[level]
+        if criterion == "head_to_head":
+            played = [h2h_games[a][b] for a in indices for b in indices if a != b]
+            valid = len(set(played)) <= 1
+            values = {i: sum(h2h_points[i][j] for j in indices if j != i) if valid else 0.0 for i in indices}
+        elif criterion == "coin":
+            values = {i: rng.random() for i in indices}
+        else:
+            values = {i: metrics[i].get(criterion, 0.0) for i in indices}
+        buckets = defaultdict(list)
+        for i in indices:
+            buckets[values[i]].append(i)
+        result = []
+        for value in sorted(buckets, reverse=True):
+            result.extend(sort_group(buckets[value], level + 1))
+        return result
+
+    winners = []
+    for division in division_ids:
+        members = [i for i, row in enumerate(metrics) if row["division_id"] == division]
+        if members:
+            winners.append(sort_group(members)[0])
+    selected = set(winners)
+    winners.extend(sort_group([i for i in range(len(metrics)) if i not in selected]))
+    return winners if winners else sort_group(list(range(len(metrics))))
+
+
+def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
+                         regular_season_count, playoff_team_count, postseason_rows, actual_wins):
+    """Sample valid round-robin schedules and aggregate standings and playoff outcomes."""
+    team_count = len(labels)
+    rng = random.Random((LEAGUE_ID * 1000003) ^ (YEAR * 9176) ^ completed_week)
+    score_by_week = defaultdict(dict)
+    for row in score_rows:
+        if row["week"] <= completed_week:
+            score_by_week[int(row["week"])][row["team"]] = float(row["score"])
+    postseason_by_week = defaultdict(dict)
+    for row in postseason_rows:
+        postseason_by_week[int(row["week"])][row["team"]] = float(row["score"])
+    complete_weeks = [week for week in range(1, completed_week + 1)
+                      if all(team in score_by_week[week] for team in labels)]
+    base_rounds = _round_robin_rounds(team_count, rng) if team_count > 1 else []
+    if not base_rounds:
+        return {"simulations": 0, "weeks_used": [], "actual_wins": actual_wins,
+                "distributions": {}, "first_place_counts": {},
+                "playoff": {"semifinals_complete": False, "finals_complete": False,
+                            "semifinal_matchups": {}, "final_matchups": {}, "champions": {}}}
+    repeats = max(0, regular_season_count - len(base_rounds))
+    schedule = base_rounds + [base_rounds[i % len(base_rounds)] for i in range(repeats)]
+    division_by_name = {str(team.team_name): str(getattr(team, "division_id", None)) for team in teams}
+    division_ids = [str(key) for key in getattr(league.settings, "division_map", {}).keys()]
+    tie_rule = str(getattr(league.settings, "playoff_seed_tie_rule", "H2H_RECORD") or "H2H_RECORD")
+    distributions = {name: Counter() for name in labels}
+    first_counts, semi_counts, final_counts, champion_counts = Counter(), Counter(), Counter(), Counter()
+    samples = 0
+    rounds_count = math.ceil(math.log2(playoff_team_count)) if playoff_team_count > 1 else 0
+    period_length = max(1, int(getattr(league.settings, "playoff_matchup_period_length", 1) or 1))
+    playoff_start = regular_season_count + 1
+    complete_postseason_weeks = {week for week, scores in postseason_by_week.items()
+                                 if all(team in scores for team in labels)}
+
+    for _ in range(MULTIVERSE_SIMULATIONS):
+        wins, ties, games = [0] * team_count, [0] * team_count, [0] * team_count
+        points_against = [0.0] * team_count
+        div_wins, div_games = [0.0] * team_count, [0] * team_count
+        h2h_points = [[0.0] * team_count for _ in labels]
+        h2h_games = [[0] * team_count for _ in labels]
+        for week in complete_weeks:
+            if week > len(schedule):
+                continue
+            for left, right in schedule[week - 1]:
+                left_score, right_score = score_by_week[week][labels[left]], score_by_week[week][labels[right]]
+                games[left] += 1; games[right] += 1
+                points_against[left] += right_score; points_against[right] += left_score
+                if left_score > right_score:
+                    wins[left] += 1; h2h_points[left][right] += 1
+                elif right_score > left_score:
+                    wins[right] += 1; h2h_points[right][left] += 1
+                else:
+                    ties[left] += 1; ties[right] += 1
+                    h2h_points[left][right] += .5; h2h_points[right][left] += .5
+                h2h_games[left][right] += 1; h2h_games[right][left] += 1
+                if division_by_name[labels[left]] == division_by_name[labels[right]]:
+                    div_games[left] += 1; div_games[right] += 1
+                    div_wins[left] += 1 if left_score > right_score else (.5 if left_score == right_score else 0)
+                    div_wins[right] += 1 if right_score > left_score else (.5 if right_score == left_score else 0)
+        metrics = []
+        for i, name in enumerate(labels):
+            points_for = sum(score_by_week[w][name] for w in complete_weeks)
+            metrics.append({"win_pct": (wins[i] + .5 * ties[i]) / games[i] if games[i] else 0,
+                            "points_for": points_for, "points_against": points_against[i],
+                            "division_pct": div_wins[i] / div_games[i] if div_games[i] else 0,
+                            "division_id": division_by_name[name]})
+            distributions[name][wins[i]] += 1
+        samples += 1
+        ranking = _multiverse_rank(metrics, h2h_points, h2h_games, division_ids, tie_rule, rng)
+        first_counts[labels[ranking[0]]] += 1
+
+        if rounds_count < 1:
+            continue
+        seed_order = [1, 2]
+        for round_size in (2 ** power for power in range(2, rounds_count + 1)):
+            seed_order = [seed for current in seed_order for seed in (current, round_size + 1 - current)]
+        nodes = [ranking[seed - 1] if seed <= playoff_team_count else None for seed in seed_order]
+        semifinal_round = max(0, rounds_count - 2)
+        round_index = 0
+        while len(nodes) > 1:
+            games_this_round = [(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)]
+            period_weeks = list(range(playoff_start + round_index * period_length,
+                                      playoff_start + (round_index + 1) * period_length))
+            if not all(week in complete_postseason_weeks for week in period_weeks):
+                break
+            if round_index == semifinal_round:
+                for left, right in games_this_round:
+                    if left is not None and right is not None:
+                        semi_counts[" vs ".join(sorted((labels[left], labels[right])))] += 1
+            winners = []
+            for left, right in games_this_round:
+                if left is None or right is None:
+                    winners.append(left if right is None else right)
+                    continue
+                left_points = sum(postseason_by_week[week][labels[left]] for week in period_weeks)
+                right_points = sum(postseason_by_week[week][labels[right]] for week in period_weeks)
+                if left_points == right_points:
+                    winner = left if ranking.index(left) < ranking.index(right) else right
+                else:
+                    winner = left if left_points > right_points else right
+                winners.append(winner)
+            if round_index == semifinal_round and len(winners) >= 2:
+                final_counts[" vs ".join(sorted((labels[winners[0]], labels[winners[1]])))] += 1
+            if round_index == rounds_count - 1 and winners:
+                champion_counts[labels[winners[0]]] += 1
+            nodes = winners
+            round_index += 1
+
+    dist = {name: [{"wins": wins, "count": count, "probability": count / max(samples, 1)}
+                   for wins, count in sorted(distributions[name].items())] for name in labels}
+    return {"simulations": samples, "weeks_used": complete_weeks, "actual_wins": actual_wins,
+            "distributions": dist, "first_place_counts": dict(first_counts),
+            "playoff": {"semifinals_complete": bool(semi_counts), "finals_complete": bool(champion_counts),
+                        "semifinal_matchups": dict(semi_counts), "final_matchups": dict(final_counts),
+                        "champions": dict(champion_counts)}}
 
 
 def _trade_rating(points_per_week):
@@ -389,16 +600,25 @@ def _build_payload(league):
     teams = sorted(league.teams, key=lambda t: (t.team_name.lower() != "league manager", t.team_name.lower()))
     labels = [str(t.team_name) for t in teams]
     team_names = {str(t.team_id): str(t.team_name) for t in teams}
-    max_week = min(max(int(league.current_week), 1), int(getattr(league.settings, "reg_season_count", 14)))
+    regular_season_count = int(getattr(league.settings, "reg_season_count", 14))
+    current_week = int(league.current_week)
+    max_week = min(max(current_week, 1), regular_season_count)
     completed_week = min(max(int(league.current_week) - 1, 0), max_week)
     current_rosters = _current_rosters(league)
 
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
     position_totals = defaultdict(lambda: {g: 0.0 for g in GROUPS})
+    source_week = defaultdict(lambda: defaultdict(lambda: {source: 0.0 for source in SOURCES}))
+    postseason_score_rows = []
 
     for week in range(1, max_week + 1):
         matchups = league.box_scores(week)
+        id_to_source, id_only_source = {}, {}
+        try:
+            id_to_source, id_only_source = _week_acquisition_sources(league, week)
+        except Exception as exc:
+            print(f"Could not load historical acquisition types for week {week}: {exc}")
         week_scores = []
         for box in matchups:
             home_id, away_id = _team_ids(box)
@@ -424,6 +644,13 @@ def _build_payload(league):
                     points = _safe_float(getattr(player, "points", 0))
                     position_week[name][week][pos] += points
                     position_totals[name][pos] += points
+                    player_id = int(getattr(player, "playerId", 0) or 0)
+                    source = (
+                        id_to_source.get((str(tid), player_id))
+                        or id_only_source.get(player_id)
+                        or _source_bucket(getattr(player, "acquisitionType", ""))
+                    )
+                    source_week[name][week][source] += points
         if week > completed_week:
             continue
         if not week_scores or sum(x[1] for x in week_scores) <= 0:
@@ -436,6 +663,19 @@ def _build_payload(league):
             actual = 1.0 if score > opp else (0.5 if score == opp else 0.0)
             row = next(r for r in reversed(score_rows) if r["week"] == week and r["team"] == name)
             row.update({"xw": expected, "actual": actual})
+
+    for week in range(regular_season_count + 1, current_week):
+        try:
+            for box in league.box_scores(week):
+                home_name = str(getattr(getattr(box, "home_team", None), "team_name", ""))
+                away_name = str(getattr(getattr(box, "away_team", None), "team_name", ""))
+                if home_name and away_name:
+                    postseason_score_rows.extend([
+                        {"week": week, "team": home_name, "score": _safe_float(box.home_score)},
+                        {"week": week, "team": away_name, "score": _safe_float(box.away_score)},
+                    ])
+        except Exception as exc:
+            print(f"Could not load completed playoff scores for week {week}: {exc}")
 
     df = pd.DataFrame(score_rows)
     if not df.empty and "xw" not in df.columns:
@@ -490,10 +730,19 @@ def _build_payload(league):
             "team": name, "wins": 0, "losses": 0, "ties": 0, "games": 0,
             "pct": 0.0, "points_for": 0.0, "points_against": 0.0, "point_diff": 0.0,
         })
-    leader = min(team_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower()))
+    fallback_order = sorted(team_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower()))
+    try:
+        official_teams = league.standings_weekly(completed_week) if completed_week > 0 else league.standings()
+        official_order = [str(team.team_name) for team in official_teams]
+    except Exception as exc:
+        print(f"Could not load ESPN's weekly tiebreak standings; using points-for fallback: {exc}")
+        official_order = [row["team"] for row in fallback_order]
+    official_rank = {name: rank for rank, name in enumerate(official_order, 1)}
+    leader = min(team_records.values(), key=lambda r: official_rank.get(r["team"], len(labels) + 1))
     standings = []
-    for record in sorted(team_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower())):
-        standings.append({**record, "games_back": round(((leader["wins"] - record["wins"]) + (record["losses"] - leader["losses"])) / 2, 1)})
+    for record in sorted(team_records.values(), key=lambda r: official_rank.get(r["team"], len(labels) + 1)):
+        standings.append({**record, "espn_rank": official_rank.get(record["team"], len(standings) + 1),
+                          "games_back": round(((leader["wins"] - record["wins"]) + (record["losses"] - leader["losses"])) / 2, 1)})
 
     recent_rows = {}
     for name in labels:
@@ -599,7 +848,7 @@ def _build_payload(league):
             else:
                 record["ties"] += 1
             record["pct"] = (record["wins"] + 0.5 * record["ties"]) / record["games"]
-    bracket_records = sorted(bracket_records.values(), key=lambda r: (-r["wins"], r["losses"], -r["points_for"], r["team"].lower()))
+    bracket_records = sorted(bracket_records.values(), key=lambda r: official_rank.get(r["team"], len(labels) + 1))
     try:
         playoff_team_count = max(0, min(len(labels), int(getattr(league.settings, "playoff_team_count", 0) or 0)))
     except (TypeError, ValueError):
@@ -607,9 +856,19 @@ def _build_payload(league):
     playoff_teams = [{"seed": seed, "team": record["team"], "record": f'{record["wins"]}-{record["losses"]}-{record["ties"]}'}
                      for seed, record in enumerate(bracket_records[:playoff_team_count], 1)]
 
+    multiverse = _simulate_multiverse(
+        league, labels, teams, score_rows, completed_week, regular_season_count,
+        playoff_team_count, postseason_score_rows,
+        {name: record["wins"] for name, record in team_records.items()},
+    )
+
     weeks_for_stats = list(range(1, max_week + 1))
     weekly_positions = {
         name: [{"week": w, **{g: round(position_week[name][w][g], 2) for g in GROUPS}} for w in weeks_for_stats]
+        for name in labels
+    }
+    weekly_sources = {
+        name: [{"week": w, **{source: round(source_week[name][w][source], 2) for source in SOURCES}} for w in weeks_for_stats]
         for name in labels
     }
     heat = {name: [season_by_team.get(name, {}).get("weekly_xw", {}).get(str(w)) for w in range(1, completed_week + 1)] for name in labels}
@@ -624,16 +883,17 @@ def _build_payload(league):
 
     trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
     return {
-        "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS,
+        "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS, "sources": SOURCES,
         "current_week": int(league.current_week), "completed_week": completed_week,
         "weeks": weeks_for_stats, "season": season, "heat": heat,
         "standings": standings, "weekly_results": weekly_results,
+        "fantasy_multiverse": multiverse,
         "power_rankings": power_rankings, "power_history": power_history,
         "clutch_rankings": clutch_rankings,
         "playoff_teams": playoff_teams, "playoff_team_count": playoff_team_count,
         "bracket_live_week": bracket_live_week,
         "position_totals": {name: position_totals[name] for name in labels},
-        "weekly_positions": weekly_positions,
+        "weekly_positions": weekly_positions, "weekly_sources": weekly_sources,
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
         "trade_ratings": ratings,
         "team_abbrevs": {str(t.team_name): str(getattr(t, "team_abbrev", "") or "") for t in teams},
@@ -649,7 +909,7 @@ def _html(payload):
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expected Wins - Fantasy League Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view,.team-view,.luck-view{display:none}.league-view.active,.team-view.active,.luck-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}#standingsTable th:nth-child(8),#standingsTable td:nth-child(8),#standingsTable th:nth-child(9),#standingsTable td:nth-child(9){text-align:center}.standings-value{font-weight:700}.sortable{cursor:pointer;user-select:none}.sortable:hover{color:var(--text)}.power-highlight{text-align:center;min-height:22px;color:var(--muted);font-weight:700}.model-details{margin:4px 0 14px;color:var(--muted);font-size:13px}.model-details summary{display:inline-block;color:var(--blue);cursor:pointer;font-weight:650}.model-details p{max-width:900px;line-height:1.5;margin:8px 0 0}.live-team-name{text-align:center;font-size:clamp(20px,3vw,30px);font-weight:800;line-height:1.2;padding:8px 4px;color:var(--text)}.live-team-bottom{padding-top:0}.bracket-scroll{overflow-x:auto;padding:2px 0 10px}.bracket{display:flex;gap:16px;min-width:max-content;align-items:flex-start}.bracket-round{width:250px;display:flex;flex-direction:column;gap:12px}.bracket-round h3{font-size:14px;margin:0;color:var(--muted)}.bracket-match{border:1px solid var(--line);background:var(--bg);border-radius:10px;overflow:hidden}.bracket-side{padding:9px 11px;border-bottom:1px solid var(--line);font-size:13px}.bracket-side:last-child{border-bottom:0}.bracket-side.muted{color:var(--muted)}</style>
+<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view,.team-view,.luck-view{display:none}.league-view.active,.team-view.active,.luck-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}#standingsTable th:nth-child(8),#standingsTable td:nth-child(8),#standingsTable th:nth-child(9),#standingsTable td:nth-child(9){text-align:center}.standings-value{font-weight:700}.sortable{cursor:pointer;user-select:none}.sortable:hover{color:var(--text)}.power-highlight{text-align:center;min-height:22px;color:var(--muted);font-weight:700}.model-details{margin:4px 0 14px;color:var(--muted);font-size:13px}.model-details summary{display:inline-block;color:var(--blue);cursor:pointer;font-weight:650}.model-details p{max-width:900px;line-height:1.5;margin:8px 0 0}.live-team-name{text-align:center;font-size:clamp(20px,3vw,30px);font-weight:800;line-height:1.2;padding:8px 4px;color:var(--text)}.live-team-bottom{padding-top:0}.bracket-scroll{overflow-x:auto;padding:2px 0 10px}.bracket{display:flex;gap:16px;min-width:max-content;align-items:flex-start}.bracket-round{width:250px;display:flex;flex-direction:column;gap:12px}.bracket-round h3{font-size:14px;margin:0;color:var(--muted)}.bracket-round.bracket-final{align-self:center}.bracket-match{border:1px solid var(--line);background:var(--bg);border-radius:10px;overflow:hidden}.bracket-side{padding:9px 11px;border-bottom:1px solid var(--line);font-size:13px}.bracket-side:last-child{border-bottom:0}.bracket-side.muted{color:var(--muted)}</style>
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
@@ -659,11 +919,12 @@ def _html(payload):
 <button class="tab active" data-tab="team" role="tab" aria-selected="true">Team Stats</button><button class="tab" data-tab="league" role="tab" aria-selected="false">League Stats</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button></nav>
 
 <section class="panel active" id="panel-team" role="tabpanel">
-<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
+<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
 <section class="team-view active" id="team-view-position">
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
 </section>
+<section class="team-view" id="team-view-acquisition"><article class="card"><h2>Weekly points by acquisition</h2><p>Starter points grouped by how each player joined that roster: drafted, traded for, or acquired through waivers/free agency. ESPN data that does not identify a source is shown as Unknown.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article></section>
 <section class="team-view" id="team-view-differential">
 <article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
 <article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
@@ -674,17 +935,23 @@ def _html(payload):
 <div class="subtabs" role="tablist" aria-label="League statistics"><button class="subtab league-subtab active" type="button" data-league-view="standings" aria-selected="true">Standings</button><button class="subtab league-subtab" type="button" data-league-view="power" aria-selected="false">Power Rankings</button><button class="subtab league-subtab" type="button" data-league-view="playoffs" aria-selected="false">Playoff Bracket</button></div>
 <section class="league-view active" id="league-view-standings"><article class="card"><h2>League Standings</h2><p>Completed regular-season record, points for, points against, and point differential. Points columns use a red-to-green scale centered on the league average.</p><div class="scroll"><table id="standingsTable"></table></div></article></section>
 <section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><div class="chartbox"><canvas id="powerHistoryChart"></canvas></div><div id="powerHighlight" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="toolbar"><span>Week:</span><div id="powerWeeks" class="team-buttons" aria-label="Choose power ranking week"></div></div><div class="scroll"><table id="powerTable"></table></div></article></section>
-<section class="league-view" id="league-view-playoffs"><article class="card"><h2>Playoff Bracket If the Season Ended Today</h2><p id="playoffBracketNote">Projected seeds use current standings, including live regular-season scores when available.</p><h3>Winners Bracket</h3><div id="playoffBracket" class="bracket-scroll"></div><h3>Losers Bracket</h3><div id="losersBracket" class="bracket-scroll"></div></article></section>
+<section class="league-view" id="league-view-playoffs"><article class="card"><h2>Playoff Bracket If the Season Ended Today</h2><p id="playoffBracketNote">Projected seeds use current standings, including live regular-season scores when available.</p><h3>Winners Bracket</h3><div id="playoffBracket" class="bracket-scroll"></div></article></section>
 </section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
-<div class="subtabs" role="tablist" aria-label="Luck statistics"><button class="subtab luck-subtab active" type="button" data-luck-view="luck" aria-selected="true">Luck</button><button class="subtab luck-subtab" type="button" data-luck-view="clutch" aria-selected="false">Clutch Rating</button></div>
+<div class="subtabs" role="tablist" aria-label="Luck statistics"><button class="subtab luck-subtab active" type="button" data-luck-view="luck" aria-selected="true">Luck</button><button class="subtab luck-subtab" type="button" data-luck-view="clutch" aria-selected="false">Clutch Rating</button><button class="subtab luck-subtab" type="button" data-luck-view="multiverse" aria-selected="false">Fantasy Multiverse</button></div>
 <section class="luck-view active" id="luck-view-luck">
 <article class="card"><h2>Expected wins and actual wins</h2><p>Expected wins compare each team's score with every other team that week. The shaded gap shows schedule luck.</p><div class="toolbar"><span>Team:</span><div id="luckTeams" class="team-buttons" aria-label="Choose team"></div><span id="luckNote" class="muted"></span></div><div class="chartbox"><canvas id="luckLine"></canvas></div></article>
 <article class="card"><h2>Schedule luck (actual wins minus expected wins)</h2><p>Positive means a team won more often than its points would predict against the league; negative means fewer.</p><div class="chartbox"><canvas id="luckBars"></canvas></div></article>
 <article class="card"><h2>Weekly expected win share</h2><p>Each cell is the share of league teams outscored that week. 1.00 is the top score.</p><div class="scroll"><table id="heat"></table></div></article>
 </section>
 <section class="luck-view" id="luck-view-clutch"><article class="card"><h2>Clutch Rating</h2><div class="chartbox"><canvas id="clutchChart"></canvas></div></article></section>
+<section class="luck-view" id="luck-view-multiverse">
+<article class="card"><h2>Fantasy Multiverse</h2><p>Win distributions compare each team’s actual weekly scores against 20,000 sampled valid schedules. Teams face every opponent once, then repeat the same early-season opponents for the remaining regular-season weeks.</p><div class="toolbar"><span>Team:</span><div id="multiverseTeams" class="team-buttons" aria-label="Choose multiverse team"></div><span id="multiverseTeamLabel" class="muted"></span></div><div class="chartbox"><canvas id="multiverseTeamChart"></canvas></div></article>
+<article class="card"><h2>All Teams’ Win Distributions</h2><div id="multiverseAllLabel" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="chartbox"><canvas id="multiverseAllChart"></canvas></div></article>
+<article class="card"><h2>First Place Across Schedules</h2><div class="chartbox"><canvas id="multiverseFirstPie"></canvas></div></article>
+<article class="card"><h2>Playoff Titles Across Schedules</h2><div id="multiversePlayoffNote" class="muted"></div><div class="chartbox"><canvas id="multiversePlayoffPie"></canvas></div></article>
+</section>
 </section>
 
 <section class="panel" id="panel-live" role="tabpanel">
@@ -715,6 +982,10 @@ const positionAxisMin=Math.min(0,Math.floor(Math.min(0,...positionRows.map(row=>
 const posChart=new Chart(document.getElementById('positionChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:positionGroups.map((g)=>({label:g,data:[],backgroundColor:colors[D.groups.indexOf(g)]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
 function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=t;posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[positionGroups[i]]||0));posChart.update();}
 const positionButtons=fillTeamButtons('positionTeams',showPosition);
+const sourceColors={Drafted:'#4da3ff',Traded:'#da70d6',Waivers:'#f5a623',Unknown:'#8b98a5'};
+const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
+function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=team;sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
+const sourceButtons=fillTeamButtons('sourceTeams',showSource);
 const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
 function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+team;differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
@@ -731,9 +1002,9 @@ const sortLabels={wins:'W',losses:'L',ties:'T',pct:'PCT',games_back:'GB',points_
 const defaultSortDirection={wins:-1,losses:1,ties:-1,pct:-1,games_back:1,points_for:-1,points_against:1,point_diff:-1};let standingsSort='wins',standingsDirection=-1;
 function renderStandings(){
   const key=sortKeys[standingsSort]||'wins',direction=standingsDirection;
-  const rows=[...D.standings].sort((a,b)=>direction*(Number(a[key]||0)-Number(b[key]||0))||a.team.localeCompare(b.team));
+  const rows=[...D.standings].sort((a,b)=>standingsSort==='wins'?(Number(a.espn_rank||999)-Number(b.espn_rank||999)):direction*(Number(a[key]||0)-Number(b[key]||0))||a.team.localeCompare(b.team));
   standingsTable.replaceChildren();const header=document.createElement('tr');
-  [['Rank',null],['Team',null],...Object.entries(sortLabels).map(([k,label])=>[label,k])].forEach(([label,k])=>{const th=document.createElement('th');th.textContent=label+(k===standingsSort?(direction<0?' ▼':' ▲'):'');if(k){th.className='sortable';th.setAttribute('aria-sort',k===standingsSort?(direction<0?'descending':'ascending'):'none');th.title='Sort by '+label;th.addEventListener('click',()=>{if(standingsSort===k)standingsDirection*=-1;else{standingsSort=k;standingsDirection=defaultSortDirection[k];}renderStandings();});}header.append(th);});standingsTable.append(header);
+  [['Rank',null],['Team',null],...Object.entries(sortLabels).map(([k,label])=>[label,k])].forEach(([label,k])=>{const th=document.createElement('th');th.textContent=label+(k===standingsSort?(direction<0?' ▼':' ▲'):'');if(k){th.className='sortable';th.setAttribute('aria-sort',k===standingsSort?(direction<0?'descending':'ascending'):'none');th.title=k==='wins'?'Sort by ESPN standings order, including league tiebreakers':'Sort by '+label;th.addEventListener('click',()=>{if(k==='wins'){standingsSort='wins';standingsDirection=-1;}else if(standingsSort===k)standingsDirection*=-1;else{standingsSort=k;standingsDirection=defaultSortDirection[k];}renderStandings();});}header.append(th);});standingsTable.append(header);
   rows.forEach((row,index)=>{const tr=document.createElement('tr');[index+1,row.team,row.wins,row.losses,row.ties,Number(row.pct||0).toFixed(3),row.games_back===0?'—':Number(row.games_back||0).toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});
     const games=Number(row.games||0),pf=Number(row.points_for||0),pa=Number(row.points_against||0),diff=Number(row.point_diff||0);
     [[pf,'points_for',false],[pa,'points_against',true],[diff,'point_diff',false]].forEach(([value,metric,invert])=>{const td=document.createElement('td');td.className='standings-value';td.textContent=metric==='point_diff'?value.toFixed(1):`${value.toFixed(1)} (${games?(value/games).toFixed(1):'0.0'})`;const values=D.standings.map(r=>Number(r[metric]||0));td.style.color=colorByLeagueAverage(invert?-value:value,invert?values.map(v=>-v):values);tr.append(td);});
@@ -749,16 +1020,16 @@ powerChoices.forEach((entry,index)=>makeChoiceButton(powerWeeksHost,entry.week==
 const powerColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(1,D.teams.length))} 78% 58%)`),powerHighlight=document.getElementById('powerHighlight');let pinnedPowerTeam=null;
 const powerChart=new Chart(document.getElementById('powerHistoryChart'),{type:'line',data:{labels:powerHistory.map(row=>'W'+row.week),datasets:D.teams.map((team,index)=>({label:team,data:powerHistory.map(week=>week.teams.find(row=>row.team===team)?.rank??null),borderColor:powerColors[index],backgroundColor:powerColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18,spanGaps:false}))},options:{maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?'Week '+powerHistory[items[0].dataIndex]?.week:'',label:item=>`${D.teams[item.datasetIndex]} · rank ${item.raw}`}}},scales:{y:{reverse:true,min:1,max:D.teams.length,ticks:{stepSize:1},title:{display:true,text:'Power rank (1 is best)'}},x:{title:{display:true,text:'Completed week'}}},onHover:(event,elements)=>{if(pinnedPowerTeam===null)highlightPowerTeam(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedPowerTeam=null;highlightPowerTeam(null);}else{pinnedPowerTeam=pinnedPowerTeam===index?null:index;highlightPowerTeam(pinnedPowerTeam);}}}});
 function highlightPowerTeam(index){powerChart.data.datasets.forEach((dataset,i)=>{dataset.borderColor=index===null?powerColors[i]:(i===index?powerColors[i]:'rgba(160,170,180,.18)');dataset.backgroundColor=dataset.borderColor;dataset.borderWidth=index===i?4:1.5;dataset.pointRadius=index===i?2:0;});powerHighlight.textContent=index===null?'Hover over or click a line to highlight a team.':D.teams[index];powerHighlight.style.color=index===null?'var(--muted)':powerColors[index];powerChart.update('none');}
-const playoffBracket=document.getElementById('playoffBracket'),losersBracket=document.getElementById('losersBracket'),playoffNote=document.getElementById('playoffBracketNote');
+const playoffBracket=document.getElementById('playoffBracket'),playoffNote=document.getElementById('playoffBracketNote');
 function renderPlayoffBracket(){
-  playoffBracket.replaceChildren();losersBracket.replaceChildren();
+  playoffBracket.replaceChildren();
   playoffNote.textContent=D.bracket_live_week?`Includes in-progress Week ${D.bracket_live_week} scores; refreshes with dashboard updates.`:'Based on current standings; refreshes with dashboard updates.';
   const entrants=D.playoff_teams||[];
-  if(!D.playoff_team_count||!entrants.length){const p=document.createElement('p');p.className='muted';p.textContent='ESPN does not report playoff teams for this league.';playoffBracket.append(p);losersBracket.append(p.cloneNode(true));return;}
+  if(!D.playoff_team_count||!entrants.length){const p=document.createElement('p');p.className='muted';p.textContent='ESPN does not report playoff teams for this league.';playoffBracket.append(p);return;}
   let size=2;while(size<entrants.length)size*=2;
   let seedOrder=[1,2];for(let n=4;n<=size;n*=2)seedOrder=seedOrder.flatMap(seed=>[seed,n+1-seed]);
   const bySeed=new Map(entrants.map(row=>[row.seed,`#${row.seed} · ${row.team} (${row.record})`]));
-  let nodes=seedOrder.map(seed=>bySeed.get(seed)||null),roundIndex=0,gameNumber=1;const bracket=document.createElement('div');bracket.className='bracket';const upperRounds=[];
+  let nodes=seedOrder.map(seed=>bySeed.get(seed)||null),roundIndex=0,gameNumber=1;const bracket=document.createElement('div');bracket.className='bracket';
   while(nodes.length>1){
     const matches=[],next=[];
     for(let i=0;i<nodes.length;i+=2){
@@ -767,22 +1038,12 @@ function renderPlayoffBracket(){
       next.push(left&&!right?left:right&&!left?right:`Winner of Game ${number}`);
     }
     const round=document.createElement('div');round.className='bracket-round';const heading=document.createElement('h3');
+    if(matches.length===1)round.classList.add('bracket-final');
     heading.textContent=matches.length===1?'Championship':(roundIndex===0&&entrants.length<size?'First Round':matches.length===2?'Semifinals':matches.length===4?'Quarterfinals':`Round ${roundIndex+1}`);round.append(heading);
     matches.forEach(match=>{const card=document.createElement('div');card.className='bracket-match';[match.left,match.right].forEach(label=>{const side=document.createElement('div');side.className='bracket-side'+(label==='BYE'||label.startsWith('Winner of')?' muted':'');side.textContent=label;card.append(side);});round.append(card);});
-    bracket.append(round);upperRounds.push(matches.filter(match=>match.left!=='BYE'&&match.right!=='BYE'));nodes=next;roundIndex++;
+    bracket.append(round);nodes=next;roundIndex++;
   }
   playoffBracket.append(bracket);
-  const lower=document.createElement('div');lower.className='bracket';let lowerRoundIndex=0,lowerGame=1,lowerNodes=[];
-  function renderLowerRound(matchups,title){if(!matchups.length)return lowerNodes;const round=document.createElement('div');round.className='bracket-round';const heading=document.createElement('h3');heading.textContent=title;round.append(heading);const next=[];matchups.forEach(([a,b])=>{const game=lowerGame++,card=document.createElement('div');card.className='bracket-match';[a||'BYE',b||'BYE'].forEach(label=>{const side=document.createElement('div');side.className='bracket-side'+(label==='BYE'||label.startsWith('Winner of')||label.startsWith('Loser of')?' muted':'');side.textContent=label;card.append(side);});round.append(card);next.push(a&&!b?a:b&&!a?b:`Winner of Losers Game ${game}`);});lower.append(round);lowerRoundIndex++;return next;}
-  function pairLower(nodes){const pairs=[];for(let i=0;i<nodes.length;i+=2)pairs.push([nodes[i],nodes[i+1]||null]);return pairs;}
-  const opening=upperRounds[0]||[];
-  lowerNodes=renderLowerRound(pairLower(opening.map(game=>`Loser of Game ${game.number}`)),'Losers Round 1');
-  for(let r=1;r<upperRounds.length;r++){
-    const incoming=(upperRounds[r]||[]).map(game=>`Loser of Game ${game.number}`);
-    lowerNodes=renderLowerRound(pairLower([...lowerNodes,...incoming]),`Losers Round ${lowerRoundIndex+1}`);
-    if(r<upperRounds.length-1&&lowerNodes.length>1)lowerNodes=renderLowerRound(pairLower(lowerNodes),`Losers Round ${lowerRoundIndex+1}`);
-  }
-  losersBracket.append(lower);
 }
 renderPlayoffBracket();
 function bindSubtabs(buttonSelector,viewSelector,prefix,key){document.querySelectorAll(buttonSelector).forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll(buttonSelector).forEach(other=>{const active=other===button;other.classList.toggle('active',active);other.setAttribute('aria-selected',String(active));});document.querySelectorAll(viewSelector).forEach(view=>view.classList.toggle('active',view.id===prefix+button.dataset[key]));requestAnimationFrame(()=>document.querySelectorAll('.panel.active canvas').forEach(canvas=>Chart.getChart(canvas)?.resize()));}));}
@@ -797,6 +1058,22 @@ const heat=document.getElementById('heat');const hr=document.createElement('tr')
 
 let liveGameActivity=[];const gameActivityPlugin={id:'gameActivity',beforeDatasetsDraw(chart){if(chart.canvas.id!=='liveChart'||!chart.data.labels.length)return;const {ctx,chartArea,scales}=chart,xScale=scales.x;if(!chartArea||!xScale)return;ctx.save();ctx.fillStyle='rgba(167,179,194,.10)';for(let i=0;i<liveGameActivity.length;i++){if(!liveGameActivity[i])continue;const x=xScale.getPixelForValue(i),before=i?xScale.getPixelForValue(i-1):null,after=i<liveGameActivity.length-1?xScale.getPixelForValue(i+1):null,half=(before!==null?Math.abs(x-before)/2:after!==null?Math.abs(after-x)/2:4),left=Math.max(chartArea.left,before===null?x-half:(before+x)/2),right=Math.min(chartArea.right,after===null?x+half:(x+after)/2);ctx.fillRect(left,chartArea.top,Math.max(1,right-left),chartArea.bottom-chartArea.top);}ctx.restore();}};Chart.register(gameActivityPlugin);
 let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{labels:[],datasets:[{label:'Home win probability',data:[],borderColor:colors[0],backgroundColor:colors[0],fill:{target:1,above:'rgba(245,166,35,.28)',below:'rgba(77,163,255,.25)'},pointRadius:0,borderWidth:2.5,tension:.18},{label:'50%',data:[],borderColor:'#c9d4de',borderDash:[7,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},title:{display:false}},interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Home team win probability (%)'}},x:{ticks:{maxTicksLimit:10,maxRotation:0}}}}});
+const multiverse=D.fantasy_multiverse||{},multiverseTeamsHost=document.getElementById('multiverseTeams'),multiverseColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(D.teams.length,1))} 78% 58%)`),multiverseBins=Array.from({length:Math.max(1,(multiverse.weeks_used||[]).length+1)},(_,i)=>i),multiverseCounts=multiverse.distributions||{};
+function multiverseProbability(team){const rows=multiverseCounts[team]||[],total=multiverse.simulations||1;return multiverseBins.map(wins=>{const item=rows.find(row=>row.wins===wins);return item?100*item.count/total:0;});}
+const multiverseMarker={id:'multiverseActualMarker',afterDraw(chart){const actual=chart.$actualWins;if(actual===undefined||actual===null)return;const x=chart.scales.x.getPixelForValue(actual);if(!Number.isFinite(x))return;const {ctx,chartArea}=chart;ctx.save();ctx.strokeStyle='#f5a623';ctx.lineWidth=2;ctx.setLineDash([7,5]);ctx.beginPath();ctx.moveTo(x,chartArea.top);ctx.lineTo(x,chartArea.bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#f5a623';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('Actual: '+actual,x,chartArea.top+14);ctx.restore();}};Chart.register(multiverseMarker);
+let selectedMultiverseTeam=D.teams[0]||'',pinnedMultiverseIndex=null;
+const multiverseTeamChart=new Chart(document.getElementById('multiverseTeamChart'),{type:'bar',data:{labels:multiverseBins.map(String),datasets:[{label:'Probability',data:[],backgroundColor:'rgba(77,163,255,.65)',borderColor:'#4da3ff',borderWidth:1}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:item=>item.raw.toFixed(2)+'% of simulated schedules'}}},scales:{x:{title:{display:true,text:'Wins'}},y:{beginAtZero:true,title:{display:true,text:'Schedule probability (%)'}}}}});
+function showMultiverseTeam(team){selectedMultiverseTeam=team;const index=D.teams.indexOf(team),probabilities=multiverseProbability(team);multiverseTeamChart.data.datasets[0].data=probabilities;multiverseTeamChart.data.datasets[0].backgroundColor=`${multiverseColors[index]}`;multiverseTeamChart.data.datasets[0].borderColor=multiverseColors[index];multiverseTeamChart.$actualWins=multiverse.actual_wins?.[team]??null;multiverseTeamChart.options.plugins.title={display:true,text:team+' · wins under simulated schedules'};multiverseTeamChart.update();document.getElementById('multiverseTeamLabel').textContent=`Real schedule: ${multiverse.actual_wins?.[team]??0} wins · ${multiverse.simulations||0} schedules`;
+ [...multiverseTeamsHost.children].forEach(button=>{const active=button.title===team;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});}
+function highlightMultiverseLine(index){const team=index===null?null:D.teams[index];multiverseAllChart.data.datasets.forEach((dataset,i)=>{dataset.borderColor=index===null?multiverseColors[i]:(i===index?multiverseColors[i]:'rgba(160,170,180,.18)');dataset.backgroundColor=dataset.borderColor;dataset.borderWidth=i===index?4:1.5;dataset.pointRadius=i===index?3:0;});multiverseAllChart.$actualWins=team?multiverse.actual_wins?.[team]:null;const label=document.getElementById('multiverseAllLabel');label.textContent=team?`${team} · ${multiverse.actual_wins?.[team]??0} wins on the real schedule`:'Hover over or click a line to highlight a team.';label.style.color=index===null?'var(--muted)':multiverseColors[index];multiverseAllChart.update('none');}
+const multiverseAllChart=new Chart(document.getElementById('multiverseAllChart'),{type:'line',data:{labels:multiverseBins.map(String),datasets:D.teams.map((team,index)=>({label:team,data:multiverseProbability(team),borderColor:multiverseColors[index],backgroundColor:multiverseColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18}))},options:{maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:item=>`${D.teams[item.datasetIndex]}: ${item.raw.toFixed(2)}%`}}},scales:{x:{title:{display:true,text:'Wins'}},y:{beginAtZero:true,title:{display:true,text:'Schedule probability (%)'}}},onHover:(event,elements)=>{if(pinnedMultiverseIndex===null)highlightMultiverseLine(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedMultiverseIndex=null;highlightMultiverseLine(null);}else{pinnedMultiverseIndex=pinnedMultiverseIndex===index?null:index;highlightMultiverseLine(pinnedMultiverseIndex);if(pinnedMultiverseIndex!==null)showMultiverseTeam(D.teams[pinnedMultiverseIndex]);}}}});
+D.teams.forEach(team=>makeChoiceButton(multiverseTeamsHost,teamAbbrev(team),team,false,()=>{showMultiverseTeam(team);highlightMultiverseLine(D.teams.indexOf(team));}));
+showMultiverseTeam(selectedMultiverseTeam);
+function makePieChart(id,counts,title){const entries=D.teams.map(team=>[team,Number(counts[team]||0)]).filter(([,value])=>value>0);return new Chart(document.getElementById(id),{type:'pie',data:{labels:entries.map(([team])=>team),datasets:[{data:entries.map(([,value])=>value),backgroundColor:entries.map(([team])=>multiverseColors[D.teams.indexOf(team)]),borderColor:'#161d26',borderWidth:2}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:title},legend:{position:'bottom'},tooltip:{callbacks:{label:item=>{const total=item.dataset.data.reduce((sum,value)=>sum+value,0);return `${item.label}: ${item.raw.toLocaleString()} (${(100*item.raw/(total||1)).toFixed(1)}%)`;}}}}}});}
+makePieChart('multiverseFirstPie',multiverse.first_place_counts||{},'First-place finishes');
+const playoffPieCanvas=document.getElementById('multiversePlayoffPie'),playoffNote=document.getElementById('multiversePlayoffNote');
+if(multiverse.playoff?.finals_complete){playoffNote.textContent='Based on completed playoff scoring weeks; semifinal and final matchup frequencies are retained in the generated dashboard data.';makePieChart('multiversePlayoffPie',multiverse.playoff.champions,'Potential playoff titles');}else{playoffPieCanvas.style.display='none';playoffNote.textContent='Playoff semifinal, final, and champion schedule outcomes will be calculated as postseason scores become available.';}
+
 const liveWeeksHost=document.getElementById('liveWeeks'),liveMatchupsHost=document.getElementById('liveMatchups'),liveNote=document.getElementById('liveNote'),liveCache={};let selectedLiveWeek='',selectedLiveMatchup=0;function makeChoiceButton(host,label,title,active,onClick){const b=document.createElement('button');b.type='button';b.className='team-button'+(active?' active':'');b.textContent=label;b.title=title;b.setAttribute('aria-label',title);b.setAttribute('aria-pressed',String(active));b.addEventListener('click',onClick);host.append(b);return b;}function fillLiveWeeks(){const keys=(D.live_weeks||[]).map(Number).filter(Number.isFinite).sort((a,b)=>b-a);if(!keys.length){makeChoiceButton(liveWeeksHost,'—','No snapshots recorded',false,()=>{});liveNote.textContent='No snapshots recorded';return;}selectedLiveWeek=String(keys[0]);keys.forEach(w=>makeChoiceButton(liveWeeksHost,'W'+w,'Week '+w+(w===D.current_week?' (current)':''),String(w)===selectedLiveWeek,()=>{selectedLiveWeek=String(w);[...liveWeeksHost.children].forEach((b,i)=>{const active=keys[i]===w;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));});selectedLiveMatchup=0;loadLive();}));}
 function showLive(){const snap=liveCache[selectedLiveWeek];if(!snap||!snap.matchups){liveNote.textContent='No recorded snapshots for this week.';return;}liveMatchupsHost.replaceChildren();const order=snap.matchups.map((_,i)=>i).sort((a,b)=>{const rank=i=>snap.matchups[i].some(n=>n.toLowerCase()==='league manager')?0:1;return rank(a)-rank(b)||a-b;});order.forEach(i=>{const m=snap.matchups[i],label=teamAbbrev(m[0])+' vs '+teamAbbrev(m[1]);makeChoiceButton(liveMatchupsHost,label,m[0]+' vs '+m[1],i===selectedLiveMatchup,()=>{selectedLiveMatchup=i;showLive();});});if(selectedLiveMatchup>=snap.matchups.length)selectedLiveMatchup=0;const i=selectedLiveMatchup;const rows=(snap.snaps||[]).filter(s=>s[1]?.[i]);const home=snap.matchups[i]?.[0]||'Home',away=snap.matchups[i]?.[1]||'Away';document.getElementById('liveTopTeam').textContent=home;document.getElementById('liveBottomTeam').textContent=away;liveChart.data.labels=rows.map(s=>new Date(s[0]*1000).toLocaleTimeString([],{weekday:'short',hour:'numeric',minute:'2-digit'}));liveGameActivity=rows.map(s=>Boolean(s[1][i][3]));liveChart.data.datasets[0].label=home+' win probability';liveChart.data.datasets[0].data=rows.map(s=>s[1][i][2]);liveChart.data.datasets[1].data=rows.map(()=>50);liveChart.update();liveNote.textContent=rows.length?`${rows.length} snapshots · latest ${new Date(rows.at(-1)[0]*1000).toLocaleString()}`:'Waiting for game snapshots.';}
 async function loadLive(){const week=selectedLiveWeek;if(!week||!/^\d+$/.test(week)){showLive();return;}try{const res=await fetch(`live_week_${week}.json?t=${Date.now()}`,{cache:'no-store'});if(res.ok)liveCache[week]=await res.json();}catch(_){}showLive();}
