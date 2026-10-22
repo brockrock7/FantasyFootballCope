@@ -52,6 +52,21 @@ def _probability(home_score, away_score, home_lineup, away_lineup):
     return round(100.0 * wins / SIMULATIONS, 1)
 
 
+def _game_in_progress(*lineups):
+    """Report whether ESPN marks any active starter as currently playing."""
+    for lineup in lineups:
+        for player in lineup or []:
+            if getattr(player, "slot_position", "") in ("BE", "IR"):
+                continue
+            try:
+                progress = float(getattr(player, "game_played", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if 0 < progress < 100:
+                return True
+    return False
+
+
 def main():
     league = League(
         league_id=LEAGUE_ID,
@@ -68,13 +83,16 @@ def main():
         if not home or not away:
             continue
         matchups.append([home, away])
+        home_lineup = getattr(box, "home_lineup", [])
+        away_lineup = getattr(box, "away_lineup", [])
         values.append([
             round(float(box.home_score or 0), 2),
             round(float(box.away_score or 0), 2),
             _probability(
                 box.home_score, box.away_score,
-                getattr(box, "home_lineup", []), getattr(box, "away_lineup", []),
+                home_lineup, away_lineup,
             ),
+            _game_in_progress(home_lineup, away_lineup),
         ])
 
     now = int(time.time())
