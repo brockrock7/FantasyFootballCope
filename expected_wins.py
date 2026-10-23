@@ -78,6 +78,84 @@ def _week_acquisition_sources(league, week):
     return by_team_and_player, by_player
 
 
+def _draft_acquisition_sources(league):
+    """Map draft picks to their original fantasy teams when ESPN provides them."""
+    result = {}
+    try:
+        data = league.espn_request.league_get(params={"view": "mDraftDetail"})
+    except Exception as exc:
+        print(f"Could not load draft picks for acquisition fallback: {exc}")
+        return result
+    detail = data.get("draftDetail") or {}
+    picks = detail.get("picks") or detail.get("draftPicks") or []
+    for pick in picks:
+        if not isinstance(pick, dict):
+            continue
+        team_id = pick.get("teamId") or pick.get("team_id")
+        player_id = pick.get("playerId") or pick.get("player_id")
+        if player_id is None:
+            player = pick.get("player") or {}
+            player_id = player.get("id") if isinstance(player, dict) else None
+        if team_id is not None and player_id is not None:
+            result[(str(team_id), int(player_id))] = "Drafted"
+    return result
+
+
+def _weekly_transaction_acquisitions(league, max_week):
+    """Reconstruct roster acquisition types from draft picks and executed moves.
+
+    Roster responses and BoxPlayer objects sometimes omit acquisitionType.
+    Applying transaction moves to the draft ownership map provides a per-week
+    fallback for players whose ESPN roster label is blank or unfamiliar.
+    """
+    ownership = _draft_acquisition_sources(league)
+    by_week = {}
+    for week in range(1, max_week + 1):
+        changes = []
+        for transaction_type in ("TRADE_ACCEPT", "WAIVER", "FREEAGENT"):
+            try:
+                transactions = league.transactions(
+                    scoring_period=week,
+                    types={transaction_type},
+                    fill_trade_items=True,
+                    fill_from="week",
+                )
+            except Exception as exc:
+                if "no transactions found" not in str(exc).lower() and not (isinstance(exc, KeyError) and exc.args == ("status",)):
+                    print(f"Could not load {transaction_type} acquisitions for week {week}: {exc}")
+                continue
+            for transaction in transactions or []:
+                status = str(getattr(transaction, "status", "")).upper()
+                if status and status not in {"EXECUTED", "PROCESSED"}:
+                    continue
+                date = int(getattr(transaction, "date", 0) or 0)
+                changes.append((date, transaction_type, transaction))
+        for _, transaction_type, transaction in sorted(changes, key=lambda row: row[0]):
+            transaction_team = str(getattr(transaction, "team_id", "") or "")
+            for item in getattr(transaction, "items", []) or []:
+                player_id = getattr(item, "playerId", None)
+                if player_id is None:
+                    continue
+                player_id = int(player_id)
+                from_id = str(getattr(item, "from_team_id", None) or "")
+                to_id = str(getattr(item, "to_team_id", None) or transaction_team)
+                item_type = str(getattr(item, "type", "")).upper()
+                if transaction_type == "TRADE_ACCEPT" and item_type == "TRADE":
+                    if from_id:
+                        ownership.pop((from_id, player_id), None)
+                    if to_id and to_id != "0":
+                        ownership[(to_id, player_id)] = "Traded"
+                elif transaction_type in {"WAIVER", "FREEAGENT"}:
+                    if item_type in {"DROP", "DROPPED"} and from_id:
+                        ownership.pop((from_id, player_id), None)
+                    elif to_id and to_id != "0":
+                        if from_id and from_id != to_id:
+                            ownership.pop((from_id, player_id), None)
+                        ownership[(to_id, player_id)] = "Waivers"
+        by_week[week] = dict(ownership)
+    return by_week
+
+
 def _round_robin_rounds(team_count, rng):
     order = list(range(team_count))
     rng.shuffle(order)
@@ -674,6 +752,7 @@ def _build_payload(league):
     source_week = defaultdict(lambda: defaultdict(lambda: {source: 0.0 for source in SOURCES}))
     starter_bench_week = defaultdict(dict)
     postseason_score_rows = []
+    acquisition_history = _weekly_transaction_acquisitions(league, max_week)
 
     for week in range(1, max_week + 1):
         matchups = league.box_scores(week)
@@ -723,14 +802,11 @@ def _build_payload(league):
                     position_totals[name][pos] += points
                     player_id = int(getattr(player, "playerId", 0) or 0)
                     source = (
-                        _source_bucket(getattr(player, "acquisitionType", ""))
+                        acquisition_history.get(week, {}).get((str(tid), player_id))
+                        or id_to_source.get((str(tid), player_id))
+                        or id_only_source.get(player_id)
+                        or _source_bucket(getattr(player, "acquisitionType", ""))
                     )
-                    if source == "Unknown":
-                        source = (
-                            id_to_source.get((str(tid), player_id))
-                            or id_only_source.get(player_id)
-                            or "Unknown"
-                        )
                     source_week[name][week][source] += points
         if week > completed_week:
             continue
@@ -1095,7 +1171,7 @@ const positionGroups=['DEF',...D.groups.filter(group=>group!=='DEF')];
 const positionRows=D.teams.flatMap(team=>D.weekly_positions[team]||[]);
 const positionAxisMax=Math.max(20,Math.ceil(Math.max(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.max(0,Number(row[group]||0)),0)))/20)*20);
 const positionAxisMin=Math.min(0,Math.floor(Math.min(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.min(0,Number(row[group]||0)),0)))/20)*20);
-function renderSortableStatsTable(id,columns,rows){const table=document.getElementById(id);let sortKey=columns[0].key,direction=1;function draw(){const ordered=[...rows].sort((a,b)=>{const left=a[sortKey],right=b[sortKey];return (typeof left==='number'&&typeof right==='number'?direction*(left-right):direction*String(left??'').localeCompare(String(right??'')))||String(a.team).localeCompare(String(b.team));});table.replaceChildren();const head=document.createElement('tr');columns.forEach(column=>{const th=document.createElement('th');th.className='sortable';th.textContent=column.label+(column.key===sortKey?(direction<0?' ▼':' ▲'):'');th.title='Sort by '+column.label;th.addEventListener('click',()=>{if(sortKey===column.key)direction*=-1;else{sortKey=column.key;direction=column.key==='team'?1:-1;}draw();});head.append(th);});table.append(head);ordered.forEach(row=>{const tr=document.createElement('tr');columns.forEach(column=>{const td=document.createElement('td');td.textContent=column.render?column.render(row):row[column.key];if(column.key==='team')td.title=row.team;tr.append(td);});table.append(tr);});}draw();}
+function renderSortableStatsTable(id,columns,rows){const table=document.getElementById(id);let sortKey=columns[0].key,direction=1;function draw(){const ordered=[...rows].sort((a,b)=>{const left=a[sortKey],right=b[sortKey];return (typeof left==='number'&&typeof right==='number'?direction*(left-right):direction*String(left??'').localeCompare(String(right??'')))||String(a.team).localeCompare(String(b.team));});table.replaceChildren();const head=document.createElement('tr');columns.forEach(column=>{const th=document.createElement('th');th.className='sortable';th.textContent=column.label+(column.key===sortKey?(direction<0?' ▼':' ▲'):'');th.title='Sort by '+column.label;th.addEventListener('click',()=>{if(sortKey===column.key)direction*=-1;else{sortKey=column.key;direction=column.key==='team'?1:-1;}draw();});head.append(th);});table.append(head);ordered.forEach(row=>{const tr=document.createElement('tr');columns.forEach(column=>{const td=document.createElement('td');td.textContent=column.render?column.render(row):row[column.key];if(column.key==='team')td.title=row.team;if(column.cellStyle)column.cellStyle(td,row);tr.append(td);});table.append(tr);});}draw();}
 const positionStatRows=D.teams.map(team=>{const played=(D.weekly_positions[team]||[]).filter(row=>positionGroups.reduce((sum,group)=>sum+Math.abs(Number(row[group]||0)),0)>0).length||1;const row={team};positionGroups.forEach(group=>{row[group]=Number(D.position_totals[team]?.[group]||0);row[group+'_display']=`${row[group].toFixed(1)} (${(row[group]/played).toFixed(1)} PPG)`;});return row;});
 renderSortableStatsTable('positionTotalsTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},...positionGroups.map(group=>({key:group,label:group,render:row=>row[group+'_display']}))],positionStatRows);
 new Chart(document.getElementById('positionTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:positionGroups.map(group=>({label:group,data:D.teams.map(team=>Number(D.position_totals[team]?.[group]||0)),backgroundColor:colors[D.groups.indexOf(group)]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}},},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
@@ -1109,8 +1185,8 @@ new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:
 const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
 function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=team;sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
 const sourceButtons=fillTeamButtons('sourceTeams',showSource);
-const starterBenchRows=D.teams.map(team=>({team,...(D.starter_bench_totals?.[team]||{actual:0,bench:0,optimal:0,left:0,left_ppg:0,actual_ppg:0,optimal_ppg:0,games:0})}));
-renderSortableStatsTable('starterBenchTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},{key:'actual',label:'Actual points (PPG)',render:row=>`${row.actual.toFixed(1)} (${row.actual_ppg.toFixed(1)})`},{key:'bench',label:'Bench points',render:row=>row.bench.toFixed(1)},{key:'optimal',label:'Optimal lineup points (PPG)',render:row=>`${row.optimal.toFixed(1)} (${row.optimal_ppg.toFixed(1)})`},{key:'left_ppg',label:'PPG left on bench',render:row=>row.left_ppg.toFixed(2)}],starterBenchRows);
+const starterBenchRows=D.teams.map(team=>{const values=D.starter_bench_totals?.[team]||{actual:0,bench:0,optimal:0,left:0,left_ppg:0,actual_ppg:0,optimal_ppg:0,games:0};return{team,...values,optimal_pct:values.optimal>0?100*values.actual/values.optimal:0};});
+renderSortableStatsTable('starterBenchTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},{key:'actual',label:'Actual points (PPG)',render:row=>`${row.actual.toFixed(1)} (${row.actual_ppg.toFixed(1)})`},{key:'bench',label:'Bench points',render:row=>row.bench.toFixed(1)},{key:'optimal',label:'Optimal lineup points (PPG)',render:row=>`${row.optimal.toFixed(1)} (${row.optimal_ppg.toFixed(1)})`},{key:'optimal_pct',label:'Actual of optimal',render:row=>`${row.optimal_pct.toFixed(1)}%`,cellStyle:(cell,row)=>{const hue=Math.max(0,Math.min(120,120*row.optimal_pct/100));cell.style.backgroundColor=`hsl(${hue},65%,38%)`;cell.style.color='#fff';cell.style.fontWeight='700';}}],starterBenchRows);
 new Chart(document.getElementById('actualOptimalChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Actual points',data:starterBenchRows.map(row=>row.actual),backgroundColor:'#4da3ff',stack:'lineup'},{label:'Optimal points added',data:starterBenchRows.map(row=>Math.max(0,row.optimal-row.actual)),backgroundColor:'#f5a623',stack:'lineup'}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 const benchLossMax=Math.max(0,...starterBenchRows.map(row=>row.left_ppg));
 new Chart(document.getElementById('benchLossChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Points left on bench per game',data:starterBenchRows.map(row=>row.left_ppg),backgroundColor:'#4da3ff'}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{},y:{beginAtZero:true,max:benchLossMax?benchLossMax*1.08:1,title:{display:true,text:'Points per game'}}}}});
