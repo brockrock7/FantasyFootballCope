@@ -6,7 +6,9 @@ import math
 import os
 import random
 import time
+from datetime import datetime, time as datetime_time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from espn_api.football import League
 
@@ -68,20 +70,39 @@ def _game_in_progress(*lineups):
 
 
 def _game_windows(*lineups):
-    """Return scheduled kickoff and three-hour end timestamps for active players."""
-    windows = set()
+    """Build league-wide kickoff windows, including unusual days and early games."""
+    eastern = ZoneInfo("America/New_York")
+    kickoffs = set()
     for lineup in lineups:
         for player in lineup or []:
-            if getattr(player, "slot_position", "") in ("BE", "IR"):
-                continue
             game_date = getattr(player, "game_date", None)
             if game_date is None:
                 continue
             try:
-                start = int(game_date.timestamp())
+                if game_date.tzinfo is None:
+                    start = game_date.replace(tzinfo=ZoneInfo("UTC"))
+                else:
+                    start = game_date
+                start = start.astimezone(eastern)
             except (AttributeError, OSError, OverflowError, TypeError, ValueError):
                 continue
-            windows.add((start, start + 3 * 60 * 60))
+            kickoffs.add(start)
+
+    windows = set()
+    sunday_dates = set()
+    for kickoff in kickoffs:
+        if kickoff.weekday() == 6 and kickoff.time() >= datetime_time(13, 0):
+            sunday_dates.add(kickoff.date())
+            continue
+        end = kickoff + timedelta(hours=3)
+        windows.add((int(kickoff.timestamp()), int(end.timestamp())))
+
+    # Sunday afternoon games run concurrently and can finish at different times.
+    # Shade one shared 1 p.m. to midnight block for the full slate.
+    for game_date in sunday_dates:
+        start = datetime.combine(game_date, datetime_time(13, 0), tzinfo=eastern)
+        end = datetime.combine(game_date + timedelta(days=1), datetime_time(0, 0), tzinfo=eastern)
+        windows.add((int(start.timestamp()), int(end.timestamp())))
     return [list(window) for window in sorted(windows)]
 
 
@@ -94,7 +115,7 @@ def main():
     )
     week = int(league.current_week)
     path = ROOT / f"live_week_{week}.json"
-    matchups, values, game_windows = [], [], []
+    matchups, values, all_lineups = [], [], []
     for box in league.box_scores(week):
         home = getattr(getattr(box, "home_team", None), "team_name", None)
         away = getattr(getattr(box, "away_team", None), "team_name", None)
@@ -103,7 +124,7 @@ def main():
         matchups.append([home, away])
         home_lineup = getattr(box, "home_lineup", [])
         away_lineup = getattr(box, "away_lineup", [])
-        game_windows.append(_game_windows(home_lineup, away_lineup))
+        all_lineups.extend((home_lineup, away_lineup))
         values.append([
             round(float(box.home_score or 0), 2),
             round(float(box.away_score or 0), 2),
@@ -115,6 +136,8 @@ def main():
         ])
 
     now = int(time.time())
+    league_game_windows = _game_windows(*all_lineups)
+    game_windows = [league_game_windows for _ in matchups]
     snapshot = {"week": week, "matchups": matchups, "snaps": [], "game_windows": game_windows}
     if path.exists():
         try:
