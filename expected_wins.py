@@ -301,6 +301,107 @@ def _bucket(position, slot):
     return POSITIONS.get(position)
 
 
+_LINEUP_SLOT_IDS = {
+    0: "QB", 1: "TQB", 2: "RB", 3: "RB/WR", 4: "WR", 5: "WR/TE",
+    6: "TE", 7: "OP", 16: "D/ST", 17: "K", 20: "BE", 21: "IR",
+    23: "RB/WR/TE",
+}
+_FLEX_ALIASES = {
+    "RB/WR": {"RB/WR", "WR/RB"},
+    "WR/TE": {"WR/TE", "TE/WR"},
+    "RB/WR/TE": {"RB/WR/TE", "RB/TE/WR", "WR/RB/TE", "WR/TE/RB", "TE/RB/WR", "TE/WR/RB", "FLEX"},
+}
+
+
+def _slot_name(value):
+    if isinstance(value, int):
+        return _LINEUP_SLOT_IDS.get(value, str(value))
+    text = str(value or "").strip().upper().replace(" ", "")
+    if text.isdigit():
+        return _LINEUP_SLOT_IDS.get(int(text), text)
+    return text
+
+
+def _eligible_for_lineup_slot(player, slot):
+    """Use ESPN eligible-slot metadata, with position-based fallback."""
+    slot = _slot_name(slot)
+    if not slot:
+        return False
+    if _slot_name(getattr(player, "slot_position", "")) == slot:
+        return True
+    eligible = getattr(player, "eligibleSlots", None) or getattr(player, "eligible_slots", None) or []
+    if not isinstance(eligible, (list, tuple, set)):
+        eligible = [eligible]
+    eligible_names = {_slot_name(item) for item in eligible}
+    aliases = _FLEX_ALIASES.get(slot, {slot})
+    if eligible_names & aliases:
+        return True
+
+    position = _slot_name(getattr(player, "position", ""))
+    if slot in ("RB/WR", "WR/TE", "RB/WR/TE", "FLEX"):
+        flex_positions = {"RB/WR": {"RB", "WR"}, "WR/TE": {"WR", "TE"}, "RB/WR/TE": {"RB", "WR", "TE"}, "FLEX": {"RB", "WR", "TE"}}
+        return position in flex_positions.get(slot, set())
+    if slot == "OP":
+        return position in {"QB", "RB", "WR", "TE"} or "OP" in eligible_names
+    if slot == "TQB":
+        return position in {"QB", "TQB"} or "TQB" in eligible_names
+    return position == slot or slot in eligible_names
+
+
+def _maximum_lineup_points(starters, candidates):
+    """Maximum points assignment to the actual starter slots (Hungarian method)."""
+    slots = [_slot_name(getattr(player, "slot_position", "")) for player in starters]
+    players = list(candidates)
+    if not slots or len(players) < len(slots):
+        return sum(_safe_float(getattr(player, "points", 0)) for player in starters)
+
+    # Rectangular minimum-cost assignment. Invalid slot/player pairs receive a
+    # very large cost; each actual starter's original slot remains eligible.
+    n, m = len(slots), len(players)
+    invalid = 10**7
+    u, v, p, way = [0.0] * (n + 1), [0.0] * (m + 1), [0] * (m + 1), [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta, j1 = float("inf"), 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                player = players[j - 1]
+                points = _safe_float(getattr(player, "points", 0))
+                cost = -points if _eligible_for_lineup_slot(player, slots[i0 - 1]) else invalid
+                current = cost - u[i0] - v[j]
+                if current < minv[j]:
+                    minv[j], way[j] = current, j0
+                if minv[j] < delta:
+                    delta, j1 = minv[j], j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = [None] * n
+    for j in range(1, m + 1):
+        if p[j]:
+            assignment[p[j] - 1] = players[j - 1]
+    return sum(_safe_float(getattr(player, "points", 0)) for player in assignment if player is not None)
+
+
 def _team_ids(box):
     return (
         getattr(getattr(box, "home_team", None), "team_id", None),
@@ -661,6 +762,9 @@ def _build_payload(league):
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
     position_totals = defaultdict(lambda: {g: 0.0 for g in GROUPS})
     source_week = defaultdict(lambda: defaultdict(lambda: {source: 0.0 for source in SOURCES}))
+    starter_points = defaultdict(float)
+    bench_points = defaultdict(float)
+    bench_points_lost = defaultdict(float)
     postseason_score_rows = []
 
     for week in range(1, max_week + 1):
@@ -687,12 +791,24 @@ def _build_payload(league):
                 (home_id, home_name, getattr(box, "home_lineup", [])),
                 (away_id, away_name, getattr(box, "away_lineup", [])),
             ):
-                for player in lineup or []:
+                lineup = list(lineup or [])
+                starters = [p for p in lineup if _slot_name(getattr(p, "slot_position", "")) not in ("", "BE", "IR")]
+                bench = [p for p in lineup if _slot_name(getattr(p, "slot_position", "")) == "BE"]
+                actual_starter_points = sum(_safe_float(getattr(p, "points", 0)) for p in starters)
+                starter_points[name] += actual_starter_points
+                bench_points[name] += sum(_safe_float(getattr(p, "points", 0)) for p in bench)
+                if starters and bench:
+                    best_lineup_points = _maximum_lineup_points(starters, starters + bench)
+                    bench_points_lost[name] += max(0.0, best_lineup_points - actual_starter_points)
+
+                for player in lineup:
                     slot = getattr(player, "slot_position", "")
+                    points = _safe_float(getattr(player, "points", 0))
+                    if _slot_name(slot) in ("BE", "IR"):
+                        continue
                     pos = _bucket(getattr(player, "position", ""), slot)
                     if pos is None:
                         continue
-                    points = _safe_float(getattr(player, "points", 0))
                     position_week[name][week][pos] += points
                     position_totals[name][pos] += points
                     player_id = int(getattr(player, "playerId", 0) or 0)
@@ -955,6 +1071,11 @@ def _build_payload(league):
         "bracket_live_week": bracket_live_week,
         "position_totals": {name: position_totals[name] for name in labels},
         "weekly_positions": weekly_positions, "weekly_sources": weekly_sources,
+        "starter_bench_totals": {
+            name: {"starters": round(starter_points[name], 2), "bench": round(bench_points[name], 2)}
+            for name in labels
+        },
+        "bench_points_lost": {name: round(bench_points_lost[name], 2) for name in labels},
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
         "trade_ratings": ratings,
         "team_abbrevs": {str(t.team_name): str(getattr(t, "team_abbrev", "") or "") for t in teams},
@@ -980,12 +1101,13 @@ def _html(payload):
 <button class="tab active" data-tab="team" role="tab" aria-selected="true">Team Stats</button><button class="tab" data-tab="league" role="tab" aria-selected="false">League Stats</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button></nav>
 
 <section class="panel active" id="panel-team" role="tabpanel">
-<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
+<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="starters" aria-selected="false">Starters vs. Bench</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
 <section class="team-view active" id="team-view-position">
 <article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
 </section>
 <section class="team-view" id="team-view-acquisition"><article class="card"><h2>Weekly points by acquisition</h2><p>Starter points are grouped using ESPN roster tags, draft picks, and accepted trade history. If ESPN omits an acquisition tag and neither the draft nor trade records identify it, the player is counted under waivers/free agency.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article><article class="card"><h2>Total points by acquisition · all teams</h2><div class="chartbox"><canvas id="sourceTotalsChart"></canvas></div></article></section>
+<section class="team-view" id="team-view-starters"><article class="card"><h2>Starter and bench points · all teams</h2><div class="chartbox"><canvas id="starterBenchChart"></canvas></div></article><article class="card"><h2>Points left on the bench · all teams</h2><div class="chartbox"><canvas id="benchLossChart"></canvas></div></article></section>
 <section class="team-view" id="team-view-differential">
 <article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
 <article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
@@ -1008,11 +1130,11 @@ def _html(payload):
 </section>
 <section class="luck-view" id="luck-view-clutch"><article class="card"><h2>Clutch Rating</h2><div class="chartbox"><canvas id="clutchChart"></canvas></div></article></section>
 <section class="luck-view" id="luck-view-multiverse">
+<article class="card"><h2>Actual Wins Compared with the Schedule Multiverse</h2><div class="scroll"><table id="multiverseSummaryTable"></table></div></article>
 <article class="card"><h2>Fantasy Multiverse</h2><p>Win distributions compare each team’s actual weekly scores against 20,000 sampled valid schedules. Teams face every opponent once, then repeat the same early-season opponents for the remaining regular-season weeks.</p><div class="toolbar"><span>Team:</span><div id="multiverseTeams" class="team-buttons" aria-label="Choose multiverse team"></div><span id="multiverseTeamLabel" class="muted"></span></div><div class="chartbox"><canvas id="multiverseTeamChart"></canvas></div></article>
 <article class="card"><h2>All Teams’ Win Distributions</h2><div id="multiverseAllLabel" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="chartbox"><canvas id="multiverseAllChart"></canvas></div></article>
 <article class="card"><h2>First Place Across Schedules</h2><div class="chartbox"><canvas id="multiverseFirstPie"></canvas></div></article>
 <article class="card"><h2>Playoff Titles Across Schedules</h2><div id="multiversePlayoffNote" class="muted"></div><div class="chartbox"><canvas id="multiversePlayoffPie"></canvas></div></article>
-<article class="card"><h2>Actual Wins Compared with the Schedule Multiverse</h2><div class="scroll"><table id="multiverseSummaryTable"></table></div></article>
 </section>
 </section>
 
@@ -1049,6 +1171,10 @@ const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',d
 function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=teamAbbrev(team);sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
 const sourceButtons=fillTeamButtons('sourceTeams',showSource);
 const sourceTotals=new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:D.sources.map(source=>({label:source,data:D.teams.map(team=>(D.weekly_sources[team]||[]).reduce((sum,row)=>sum+Number(row[source]||0),0)),backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{title:{display:true,text:'All teams · total starter points'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}},legend:{position:'bottom'}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
+const starterBenchData=D.starter_bench_totals||{},starterTotals=D.teams.map(team=>Number(starterBenchData[team]?.starters||0)),benchTotals=D.teams.map(team=>-Number(starterBenchData[team]?.bench||0)),starterBenchBound=Math.max(1,Math.ceil(Math.max(...starterTotals.map(Math.abs),...benchTotals.map(Math.abs))/20)*20);
+new Chart(document.getElementById('starterBenchChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Starters',data:starterTotals,backgroundColor:'#4da3ff',borderRadius:3,stack:'points'},{label:'Bench',data:benchTotals,backgroundColor:'#f5a623',borderRadius:3,stack:'points'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:'',label:item=>item.dataset.label==='Bench'?`Bench: ${Math.abs(item.raw).toFixed(1)} pts`:`${item.dataset.label}: ${item.raw.toFixed(1)} pts`}}},scales:{x:{stacked:true},y:{stacked:true,min:-starterBenchBound,max:starterBenchBound,title:{display:true,text:'Fantasy points (bench shown below zero)'}}}}});
+const benchLostValues=D.teams.map(team=>Number(D.bench_points_lost?.[team]||0)),benchLostBound=Math.max(1,Math.ceil(Math.max(...benchLostValues)/20)*20);
+new Chart(document.getElementById('benchLossChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Points left on bench',data:benchLostValues,backgroundColor:'#f5a623',borderRadius:3}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{beginAtZero:true,max:benchLostBound,title:{display:true,text:'Potential points missed by starter-slot substitutions'}}}}});
 const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
 function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week · '+teamAbbrev(team);differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
