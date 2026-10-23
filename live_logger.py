@@ -6,7 +6,7 @@ import math
 import os
 import random
 import time
-from datetime import datetime, time as datetime_time, timedelta
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -69,8 +69,8 @@ def _game_in_progress(*lineups):
     return False
 
 
-def _game_windows(*lineups):
-    """Build league-wide kickoff windows, including unusual days and early games."""
+def _game_windows(*lineups, pro_schedule=None):
+    """Build windows from the full NFL slate plus fantasy roster kickoff times."""
     eastern = ZoneInfo("America/New_York")
     kickoffs = set()
     for lineup in lineups:
@@ -88,6 +88,19 @@ def _game_windows(*lineups):
                 continue
             kickoffs.add(start)
 
+    # ESPN's weekly pro schedule covers NFL games even when no league team
+    # roster contains a player from that matchup.
+    for game in (pro_schedule or {}).values():
+        try:
+            scheduled = game[1]
+            if isinstance(scheduled, (int, float)):
+                scheduled = datetime.fromtimestamp(float(scheduled) / 1000.0, timezone.utc)
+            if scheduled.tzinfo is None:
+                scheduled = scheduled.replace(tzinfo=ZoneInfo("UTC"))
+            kickoffs.add(scheduled.astimezone(eastern))
+        except (IndexError, OSError, OverflowError, TypeError, ValueError):
+            continue
+
     windows = set()
     sunday_dates = set()
     for kickoff in kickoffs:
@@ -97,11 +110,10 @@ def _game_windows(*lineups):
         end = kickoff + timedelta(hours=3)
         windows.add((int(kickoff.timestamp()), int(end.timestamp())))
 
-    # Sunday afternoon games run concurrently and can finish at different times.
-    # Shade one shared 1 p.m. to midnight block for the full slate.
+    # Sunday afternoon and night games use one shared 1 p.m. to 11 p.m. block.
     for game_date in sunday_dates:
         start = datetime.combine(game_date, datetime_time(13, 0), tzinfo=eastern)
-        end = datetime.combine(game_date + timedelta(days=1), datetime_time(0, 0), tzinfo=eastern)
+        end = datetime.combine(game_date, datetime_time(23, 0), tzinfo=eastern)
         windows.add((int(start.timestamp()), int(end.timestamp())))
     return [list(window) for window in sorted(windows)]
 
@@ -136,7 +148,12 @@ def main():
         ])
 
     now = int(time.time())
-    league_game_windows = _game_windows(*all_lineups)
+    try:
+        pro_schedule = league._get_pro_schedule(week)
+    except Exception as exc:
+        print(f"Could not load the full NFL schedule for week {week}: {exc}")
+        pro_schedule = {}
+    league_game_windows = _game_windows(*all_lineups, pro_schedule=pro_schedule)
     game_windows = [league_game_windows for _ in matchups]
     snapshot = {"week": week, "matchups": matchups, "snaps": [], "game_windows": game_windows}
     if path.exists():

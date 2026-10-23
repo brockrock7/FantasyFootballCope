@@ -27,7 +27,7 @@ MULTIVERSE_SIMULATIONS = 20000
 ROOT = Path(__file__).resolve().parent
 GROUPS = ["QB", "RB", "WR", "TE", "K", "DEF"]
 POSITIONS = {"QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE", "K": "K", "D/ST": "DEF"}
-SOURCES = ["Drafted", "Traded", "Waivers"]
+SOURCES = ["Drafted", "Traded", "Waivers", "Unknown"]
 SOURCE_MAP = {
     "DRAFT": "Drafted", "DRAFTED": "Drafted",
     "TRADE": "Traded", "TRADED": "Traded",
@@ -68,45 +68,11 @@ def _week_acquisition_sources(league, week):
             if player_id is None:
                 continue
             source = _source_bucket(entry.get("acquisitionType") or pool.get("acquisitionType") or player.get("acquisitionType"))
-            if source == "Unknown":
-                pending = [entry]
-                while pending and source == "Unknown":
-                    value = pending.pop()
-                    if isinstance(value, dict):
-                        for key, nested in value.items():
-                            if str(key).lower() in {"acquisitiontype", "acquisitionsource"}:
-                                source = _source_bucket(nested)
-                                if source != "Unknown":
-                                    break
-                            if isinstance(nested, (dict, list)):
-                                pending.append(nested)
-                    elif isinstance(value, list):
-                        pending.extend(value)
             if source != "Unknown":
                 player_id = int(player_id)
                 by_team_and_player[(team_id, player_id)] = source
                 by_player[player_id] = source
     return by_team_and_player, by_player
-
-
-def _drafted_player_teams(league):
-    """Read draft ownership from ESPN's mDraftDetail endpoint."""
-    drafted = set()
-    try:
-        data = league.espn_request.league_get(params={"view": "mDraftDetail"})
-        if isinstance(data, list):
-            data = data[0] if data else {}
-        detail = data.get("draftDetail", {}) if isinstance(data, dict) else {}
-        for pick in detail.get("picks", []) or []:
-            try:
-                player_id, team_id = int(pick.get("playerId", -1)), str(pick.get("teamId", ""))
-            except (TypeError, ValueError):
-                continue
-            if player_id > 0 and team_id:
-                drafted.add((team_id, player_id))
-    except Exception as exc:
-        print(f"Could not read ESPN draft details; untagged non-trade adds will use the waiver fallback: {exc}")
-    return drafted
 
 
 def _round_robin_rounds(team_count, rng):
@@ -174,13 +140,14 @@ def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
         postseason_by_week[int(row["week"])][row["team"]] = float(row["score"])
     complete_weeks = [week for week in range(1, completed_week + 1)
                       if all(team in score_by_week[week] for team in labels)]
-    round_count = team_count if team_count % 2 else team_count - 1
-    if team_count < 2:
+    base_rounds = _round_robin_rounds(team_count, rng) if team_count > 1 else []
+    if not base_rounds:
         return {"simulations": 0, "weeks_used": [], "actual_wins": actual_wins,
                 "distributions": {}, "first_place_counts": {},
                 "playoff": {"semifinals_complete": False, "finals_complete": False,
                             "semifinal_matchups": {}, "final_matchups": {}, "champions": {}}}
-    repeats = max(0, regular_season_count - round_count)
+    repeats = max(0, regular_season_count - len(base_rounds))
+    schedule = base_rounds + [base_rounds[i % len(base_rounds)] for i in range(repeats)]
     division_by_name = {str(team.team_name): str(getattr(team, "division_id", None)) for team in teams}
     division_ids = [str(key) for key in getattr(league.settings, "division_map", {}).keys()]
     tie_rule = str(getattr(league.settings, "playoff_seed_tie_rule", "H2H_RECORD") or "H2H_RECORD")
@@ -194,10 +161,6 @@ def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
                                  if all(team in scores for team in labels)}
 
     for _ in range(MULTIVERSE_SIMULATIONS):
-        # Generate a fresh round-robin draw for every sample. Reusing one draw
-        # would make all 20,000 results identical and collapse the distributions.
-        base_rounds = _round_robin_rounds(team_count, rng)
-        schedule = base_rounds + [base_rounds[i % len(base_rounds)] for i in range(repeats)]
         wins, ties, games = [0] * team_count, [0] * team_count, [0] * team_count
         points_against = [0.0] * team_count
         div_wins, div_games = [0.0] * team_count, [0] * team_count
@@ -273,8 +236,10 @@ def _simulate_multiverse(league, labels, teams, score_rows, completed_week,
 
     dist = {name: [{"wins": wins, "count": count, "probability": count / max(samples, 1)}
                    for wins, count in sorted(distributions[name].items())] for name in labels}
+    champion_mode = bool(champion_counts)
     return {"simulations": samples, "weeks_used": complete_weeks, "actual_wins": actual_wins,
-            "distributions": dist, "first_place_counts": dict(first_counts),
+            "distributions": dist, "first_place_counts": dict(champion_counts if champion_mode else first_counts),
+            "first_place_label": "Potential playoff titles" if champion_mode else "First-place finishes",
             "playoff": {"semifinals_complete": bool(semi_counts), "finals_complete": bool(champion_counts),
                         "semifinal_matchups": dict(semi_counts), "final_matchups": dict(final_counts),
                         "champions": dict(champion_counts)}}
@@ -301,107 +266,59 @@ def _bucket(position, slot):
     return POSITIONS.get(position)
 
 
-_LINEUP_SLOT_IDS = {
-    0: "QB", 1: "TQB", 2: "RB", 3: "RB/WR", 4: "WR", 5: "WR/TE",
-    6: "TE", 7: "OP", 16: "D/ST", 17: "K", 20: "BE", 21: "IR",
-    23: "RB/WR/TE",
-}
-_FLEX_ALIASES = {
-    "RB/WR": {"RB/WR", "WR/RB"},
-    "WR/TE": {"WR/TE", "TE/WR"},
-    "RB/WR/TE": {"RB/WR/TE", "RB/TE/WR", "WR/RB/TE", "WR/TE/RB", "TE/RB/WR", "TE/WR/RB", "FLEX"},
-}
-
-
-def _slot_name(value):
-    if isinstance(value, int):
-        return _LINEUP_SLOT_IDS.get(value, str(value))
-    text = str(value or "").strip().upper().replace(" ", "")
-    if text.isdigit():
-        text = _LINEUP_SLOT_IDS.get(int(text), text)
-    if text in {"DST", "DEF", "DEFENSE", "DEFENSE/SPECIALTEAMS"}:
-        return "D/ST"
-    return text
+def _slot_positions(slot):
+    label = str(slot or "").upper().replace("D/ST", "DEF").strip()
+    aliases = {
+        "FLEX": {"RB", "WR", "TE"},
+        "RB/WR": {"RB", "WR"}, "WR/RB": {"RB", "WR"},
+        "WR/TE": {"WR", "TE"}, "TE/WR": {"WR", "TE"},
+        "RB/WR/TE": {"RB", "WR", "TE"}, "WR/RB/TE": {"RB", "WR", "TE"},
+        "OP": {"QB", "RB", "WR", "TE"},
+        "SUPERFLEX": {"QB", "RB", "WR", "TE"},
+    }
+    if label in aliases:
+        return aliases[label]
+    if "/" in label:
+        return {POSITIONS.get(part.strip(), part.strip()) for part in label.split("/")}
+    return {POSITIONS.get(label, label)} if label else set()
 
 
 def _eligible_for_lineup_slot(player, slot):
-    """Use ESPN eligible-slot metadata, with position-based fallback."""
-    slot = _slot_name(slot)
-    if not slot:
-        return False
-    if _slot_name(getattr(player, "slot_position", "")) == slot:
-        return True
-    eligible = getattr(player, "eligibleSlots", None) or getattr(player, "eligible_slots", None) or []
-    if not isinstance(eligible, (list, tuple, set)):
-        eligible = [eligible]
-    eligible_names = {_slot_name(item) for item in eligible}
-    aliases = _FLEX_ALIASES.get(slot, {slot})
-    if eligible_names & aliases:
-        return True
-
-    position = _slot_name(getattr(player, "position", ""))
-    if slot in ("RB/WR", "WR/TE", "RB/WR/TE", "FLEX"):
-        flex_positions = {"RB/WR": {"RB", "WR"}, "WR/TE": {"WR", "TE"}, "RB/WR/TE": {"RB", "WR", "TE"}, "FLEX": {"RB", "WR", "TE"}}
-        return position in flex_positions.get(slot, set())
-    if slot == "OP":
-        return position in {"QB", "RB", "WR", "TE"} or "OP" in eligible_names
-    if slot == "TQB":
-        return position in {"QB", "TQB"} or "TQB" in eligible_names
-    return position == slot or slot in eligible_names
+    position = POSITIONS.get(str(getattr(player, "position", "")).upper(), str(getattr(player, "position", "")).upper())
+    eligible = getattr(player, "eligibleSlots", []) or []
+    eligible_positions = {position}
+    for eligible_slot in eligible:
+        eligible_positions.update(_slot_positions(eligible_slot))
+    return bool(eligible_positions & _slot_positions(slot))
 
 
-def _maximum_lineup_points(starters, candidates):
-    """Maximum points assignment to the actual starter slots (Hungarian method)."""
-    slots = [_slot_name(getattr(player, "slot_position", "")) for player in starters]
-    players = list(candidates)
-    if not slots or len(players) < len(slots):
-        return sum(_safe_float(getattr(player, "points", 0)) for player in starters)
+def _optimal_lineup_points(lineup):
+    """Maximize weekly points while filling the same starter-slot mix ESPN used."""
+    players = [player for player in (lineup or []) if getattr(player, "slot_position", "") != "IR"]
+    slots = [str(getattr(player, "slot_position", "") or "")
+             for player in players if getattr(player, "slot_position", "") not in ("BE", "IR", "")]
+    if not slots:
+        return sum(_safe_float(getattr(player, "points", 0)) for player in players)
 
-    # Rectangular minimum-cost assignment. Invalid slot/player pairs receive a
-    # very large cost; each actual starter's original slot remains eligible.
-    n, m = len(slots), len(players)
-    invalid = 10**7
-    u, v, p, way = [0.0] * (n + 1), [0.0] * (m + 1), [0] * (m + 1), [0] * (m + 1)
-    for i in range(1, n + 1):
-        p[0] = i
-        j0 = 0
-        minv = [float("inf")] * (m + 1)
-        used = [False] * (m + 1)
-        while True:
-            used[j0] = True
-            i0 = p[j0]
-            delta, j1 = float("inf"), 0
-            for j in range(1, m + 1):
-                if used[j]:
+    # Dynamic programming across roster players and the league's actual starter slots.
+    # A bitmask prevents the same player from filling two positions.
+    states = {0: 0.0}
+    for slot in slots:
+        next_states = {}
+        for used, total in states.items():
+            for index, player in enumerate(players):
+                bit = 1 << index
+                if used & bit or not _eligible_for_lineup_slot(player, slot):
                     continue
-                player = players[j - 1]
-                points = _safe_float(getattr(player, "points", 0))
-                cost = -points if _eligible_for_lineup_slot(player, slots[i0 - 1]) else invalid
-                current = cost - u[i0] - v[j]
-                if current < minv[j]:
-                    minv[j], way[j] = current, j0
-                if minv[j] < delta:
-                    delta, j1 = minv[j], j
-            for j in range(m + 1):
-                if used[j]:
-                    u[p[j]] += delta
-                    v[j] -= delta
-                else:
-                    minv[j] -= delta
-            j0 = j1
-            if p[j0] == 0:
-                break
-        while True:
-            j1 = way[j0]
-            p[j0] = p[j1]
-            j0 = j1
-            if j0 == 0:
-                break
-    assignment = [None] * n
-    for j in range(1, m + 1):
-        if p[j]:
-            assignment[p[j] - 1] = players[j - 1]
-    return sum(_safe_float(getattr(player, "points", 0)) for player in assignment if player is not None)
+                mask = used | bit
+                score = total + _safe_float(getattr(player, "points", 0))
+                if score > next_states.get(mask, float("-inf")):
+                    next_states[mask] = score
+        if not next_states:
+            return sum(_safe_float(getattr(player, "points", 0))
+                       for player in players if getattr(player, "slot_position", "") not in ("BE", "IR"))
+        states = next_states
+    return max(states.values(), default=0.0)
 
 
 def _team_ids(box):
@@ -745,29 +662,12 @@ def _build_payload(league):
     max_week = min(max(current_week, 1), regular_season_count)
     completed_week = min(max(int(league.current_week) - 1, 0), max_week)
     current_rosters = _current_rosters(league)
-    drafted_player_teams = _drafted_player_teams(league)
-    trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
-    trade_acquisitions = defaultdict(list)
-    team_id_by_name = {name: team_id for team_id, name in team_names.items()}
-    for trade in trades:
-        for side in trade.get("sides", []):
-            team_id = team_id_by_name.get(side.get("team"))
-            if team_id is None:
-                continue
-            for player in side.get("incoming", []):
-                try:
-                    trade_acquisitions[(str(team_id), int(player["id"]))].append(int(trade["week"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
 
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
     position_totals = defaultdict(lambda: {g: 0.0 for g in GROUPS})
     source_week = defaultdict(lambda: defaultdict(lambda: {source: 0.0 for source in SOURCES}))
-    starter_points = defaultdict(float)
-    bench_points = defaultdict(float)
-    bench_points_lost = defaultdict(float)
-    lineup_weeks = defaultdict(int)
+    starter_bench_week = defaultdict(dict)
     postseason_score_rows = []
 
     for week in range(1, max_week + 1):
@@ -794,25 +694,26 @@ def _build_payload(league):
                 (home_id, home_name, getattr(box, "home_lineup", [])),
                 (away_id, away_name, getattr(box, "away_lineup", [])),
             ):
-                lineup = list(lineup or [])
-                starters = [p for p in lineup if _slot_name(getattr(p, "slot_position", "")) not in ("", "BE", "IR")]
-                bench = [p for p in lineup if _slot_name(getattr(p, "slot_position", "")) == "BE"]
-                actual_starter_points = sum(_safe_float(getattr(p, "points", 0)) for p in starters)
-                lineup_weeks[name] += 1
-                starter_points[name] += actual_starter_points
-                bench_points[name] += sum(_safe_float(getattr(p, "points", 0)) for p in bench)
-                if starters and bench:
-                    best_lineup_points = _maximum_lineup_points(starters, starters + bench)
-                    bench_points_lost[name] += max(0.0, best_lineup_points - actual_starter_points)
-
-                for player in lineup:
+                if week <= completed_week:
+                    actual_points = home_score if name == home_name else away_score
+                    optimal_points = _optimal_lineup_points(lineup)
+                    bench_points = sum(
+                        _safe_float(getattr(player, "points", 0))
+                        for player in lineup or []
+                        if getattr(player, "slot_position", "") == "BE"
+                    )
+                    starter_bench_week[name][week] = {
+                        "actual": actual_points,
+                        "bench": bench_points,
+                        "optimal": max(actual_points, optimal_points),
+                        "left": max(0.0, optimal_points - actual_points),
+                    }
+                for player in lineup or []:
                     slot = getattr(player, "slot_position", "")
-                    points = _safe_float(getattr(player, "points", 0))
-                    if _slot_name(slot) in ("BE", "IR"):
-                        continue
                     pos = _bucket(getattr(player, "position", ""), slot)
                     if pos is None:
                         continue
+                    points = _safe_float(getattr(player, "points", 0))
                     position_week[name][week][pos] += points
                     position_totals[name][pos] += points
                     player_id = int(getattr(player, "playerId", 0) or 0)
@@ -821,17 +722,6 @@ def _build_payload(league):
                         or id_only_source.get(player_id)
                         or _source_bucket(getattr(player, "acquisitionType", ""))
                     )
-                    if source == "Unknown":
-                        trade_weeks = trade_acquisitions.get((str(tid), player_id), [])
-                        if any(trade_week <= week for trade_week in trade_weeks):
-                            source = "Traded"
-                        elif (str(tid), player_id) in drafted_player_teams:
-                            source = "Drafted"
-                        else:
-                            # Once ESPN's direct tag, draft record, and accepted
-                            # trade history have been checked, an untagged roster
-                            # add is a waiver/free-agent acquisition.
-                            source = "Waivers"
                     source_week[name][week][source] += points
         if week > completed_week:
             continue
@@ -1053,6 +943,34 @@ def _build_payload(league):
         name: [{"week": w, **{source: round(source_week[name][w][source], 2) for source in SOURCES}} for w in weeks_for_stats]
         for name in labels
     }
+    source_totals = {
+        name: {source: round(sum(source_week[name][week][source] for week in weeks_for_stats), 2)
+               for source in SOURCES}
+        for name in labels
+    }
+    starter_bench_weekly = {
+        name: [{"week": week, **{key: round(value, 2) for key, value in row.items()}}
+               for week, row in sorted(starter_bench_week[name].items())]
+        for name in labels
+    }
+    starter_bench_totals = {}
+    for name in labels:
+        rows = starter_bench_weekly[name]
+        games = len(rows)
+        actual = sum(row["actual"] for row in rows)
+        bench = sum(row["bench"] for row in rows)
+        optimal = sum(row["optimal"] for row in rows)
+        left = sum(row["left"] for row in rows)
+        starter_bench_totals[name] = {
+            "games": games,
+            "actual": round(actual, 2),
+            "bench": round(bench, 2),
+            "optimal": round(optimal, 2),
+            "left": round(left, 2),
+            "left_ppg": round(left / games, 2) if games else 0.0,
+            "actual_ppg": round(actual / games, 2) if games else 0.0,
+            "optimal_ppg": round(optimal / games, 2) if games else 0.0,
+        }
     heat = {name: [season_by_team.get(name, {}).get("weekly_xw", {}).get(str(w)) for w in range(1, completed_week + 1)] for name in labels}
 
     live_weeks = []
@@ -1063,6 +981,7 @@ def _build_payload(league):
             continue
     live_weeks = sorted(set(live_weeks))
 
+    trades, trade_warning, ratings = _trade_data(league, team_names, completed_week)
     return {
         "year": YEAR, "league_id": LEAGUE_ID, "teams": labels, "groups": GROUPS, "sources": SOURCES,
         "current_week": int(league.current_week), "completed_week": completed_week,
@@ -1075,21 +994,9 @@ def _build_payload(league):
         "bracket_live_week": bracket_live_week,
         "position_totals": {name: position_totals[name] for name in labels},
         "weekly_positions": weekly_positions, "weekly_sources": weekly_sources,
-        "starter_bench_totals": {
-            name: {
-                "starters": round(starter_points[name], 2),
-                "bench": round(bench_points[name], 2),
-                "max_possible": round(starter_points[name] + bench_points_lost[name], 2),
-                "efficiency": round(100 * starter_points[name] / (starter_points[name] + bench_points_lost[name]), 2)
-                if starter_points[name] + bench_points_lost[name] > 0 else 0.0,
-            }
-            for name in labels
-        },
-        "bench_points_lost": {name: round(bench_points_lost[name], 2) for name in labels},
-        "bench_points_lost_ppg": {
-            name: round(bench_points_lost[name] / lineup_weeks[name], 2) if lineup_weeks[name] else 0.0
-            for name in labels
-        },
+        "source_totals": source_totals,
+        "starter_bench_totals": starter_bench_totals,
+        "starter_bench_weekly": starter_bench_weekly,
         "live_weeks": live_weeks, "trades": trades, "trade_warning": trade_warning,
         "trade_ratings": ratings,
         "team_abbrevs": {str(t.team_name): str(getattr(t, "team_abbrev", "") or "") for t in teams},
@@ -1105,39 +1012,37 @@ def _html(payload):
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expected Wins - Fantasy League Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view,.team-view,.luck-view{display:none}.league-view.active,.team-view.active,.luck-view.active{display:block}#standingsTable th,#standingsTable td{text-align:right}#powerTable{width:100%;min-width:100%;margin:0;table-layout:fixed}#powerTable th,#powerTable td{text-align:left}#powerTable th:first-child,#powerTable td:first-child{width:10%;text-align:left}#powerTable th:nth-child(2),#powerTable td:nth-child(2){width:70%;text-align:left;white-space:nowrap}#powerTable th:last-child,#powerTable td:last-child{width:20%;text-align:left}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2){text-align:left;white-space:nowrap}#standingsTable th:nth-child(8),#standingsTable td:nth-child(8),#standingsTable th:nth-child(9),#standingsTable td:nth-child(9){text-align:center}.standings-value{font-weight:700}.sortable{cursor:pointer;user-select:none}.sortable:hover{color:var(--text)}.power-highlight{text-align:center;min-height:22px;color:var(--muted);font-weight:700}.model-details{margin:4px 0 14px;color:var(--muted);font-size:13px}.model-details summary{display:inline-block;color:var(--blue);cursor:pointer;font-weight:650}.model-details p{max-width:900px;line-height:1.5;margin:8px 0 0}.live-team-name{text-align:center;font-size:clamp(20px,3vw,30px);font-weight:800;line-height:1.2;padding:8px 4px;color:var(--text)}.live-team-bottom{padding-top:0}.bracket-scroll{overflow-x:auto;padding:2px 0 10px}.bracket{display:flex;gap:16px;min-width:max-content;align-items:flex-start}.bracket-round{width:250px;display:flex;flex-direction:column;gap:12px}.bracket-round h3{font-size:14px;margin:0;color:var(--muted)}.bracket-round.bracket-final{align-self:center}.bracket-match{border:1px solid var(--line);background:var(--bg);border-radius:10px;overflow:hidden}.bracket-side{padding:9px 11px;border-bottom:1px solid var(--line);font-size:13px}.bracket-side:last-child{border-bottom:0}.bracket-side.muted{color:var(--muted)}.leaderboard-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(12px,3vw,34px);align-items:center;padding:14px 2px}.leaderboard-badge{--badge-accent:#f5a623;position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:7px;width:min(100%,280px);aspect-ratio:1;margin:auto;padding:24px;border-radius:50%;border:2px solid color-mix(in srgb,var(--badge-accent),white 18%);background:radial-gradient(circle at 35% 25%,color-mix(in srgb,var(--badge-accent),transparent 77%),transparent 48%),linear-gradient(145deg,#202a36,#10161e 72%);box-shadow:0 0 0 6px color-mix(in srgb,var(--badge-accent),transparent 88%),0 12px 34px #0008,inset 0 0 25px color-mix(in srgb,var(--badge-accent),transparent 89%)}.leaderboard-badge:before{content:'';position:absolute;inset:8px;border:1px solid color-mix(in srgb,var(--badge-accent),transparent 55%);border-radius:50%;z-index:-1}.leaderboard-icon{font-size:clamp(25px,4vw,40px);line-height:1;filter:drop-shadow(0 0 10px color-mix(in srgb,var(--badge-accent),transparent 35%))}.leaderboard-title{color:var(--badge-accent);font-size:clamp(13px,1.3vw,18px);font-weight:850;letter-spacing:.08em;text-transform:uppercase}.leaderboard-team{font-size:clamp(25px,3vw,38px);font-weight:900;line-height:1.05;text-shadow:0 2px 16px color-mix(in srgb,var(--badge-accent),transparent 45%)}.leaderboard-metric{color:#c9d4de;font-size:clamp(11px,1vw,14px);line-height:1.35}.leaderboard-empty{color:var(--muted)}</style>
-<style>.power-chartbox{height:560px;width:100%}#powerHistoryChart{width:100%!important}.leaderboard-grid{display:flex;flex-direction:column;gap:30px}.leaderboard-row{display:grid;width:100%;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(12px,3vw,34px);align-items:center;justify-items:center}.leaderboard-badge{--badge-accent:#f5a623;position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:7px;width:min(100%,280px);aspect-ratio:1;margin:auto;padding:24px;border-radius:50%;border:2px solid color-mix(in srgb,var(--badge-accent),white 18%);background:radial-gradient(circle at 35% 25%,color-mix(in srgb,var(--badge-accent),transparent 77%),transparent 48%),linear-gradient(145deg,#202a36,#10161e 72%);box-shadow:0 0 0 6px color-mix(in srgb,var(--badge-accent),transparent 88%),0 12px 34px #0008,inset 0 0 25px color-mix(in srgb,var(--badge-accent),transparent 89%)}.leaderboard-badge:before{content:'';position:absolute;inset:8px;border:1px solid color-mix(in srgb,var(--badge-accent),transparent 55%);border-radius:50%;z-index:-1}.leaderboard-icon{font-size:clamp(25px,4vw,40px);line-height:1;filter:drop-shadow(0 0 10px color-mix(in srgb,var(--badge-accent),transparent 35%))}.leaderboard-title{color:var(--badge-accent);font-size:clamp(13px,1.3vw,18px);font-weight:850;letter-spacing:.08em;text-transform:uppercase}.leaderboard-team{font-size:clamp(25px,3vw,38px);font-weight:900;line-height:1.05;text-shadow:0 2px 16px color-mix(in srgb,var(--badge-accent),transparent 45%)}.leaderboard-metric{color:#c9d4de;font-size:clamp(11px,1vw,14px);line-height:1.35}.leaderboard-last-row .leaderboard-badge{--badge-accent:#f06a6a;width:min(78%,210px);padding:18px;background:radial-gradient(circle at 35% 25%,rgba(248,81,73,.18),transparent 48%),linear-gradient(145deg,#321d22,#1a1318 72%);box-shadow:0 0 0 4px rgba(248,81,73,.08),0 8px 22px #0007,inset 0 0 22px rgba(248,81,73,.08)}.leaderboard-last-row .leaderboard-icon{font-size:clamp(23px,3vw,32px)}.leaderboard-last-row .leaderboard-team{font-size:clamp(21px,2.5vw,30px)}.leaderboard-empty{color:var(--muted)}@media(max-width:900px){.power-chartbox{height:440px}.leaderboard-row{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.leaderboard-row{grid-template-columns:1fr}.leaderboard-badge{width:min(82vw,280px)}.leaderboard-last-row .leaderboard-badge{width:min(68vw,210px)}}</style>
+<style>.team-buttons{display:flex;gap:7px;flex-wrap:wrap}.team-button{min-width:48px;padding:7px 10px;font-size:13px;font-weight:700}.team-button.active{background:#183820;border-color:#3fb950;color:#9be5aa}.team-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.trade-rating{margin-left:8px}.trade-card h3{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.subtabs{display:flex;gap:8px;margin:4px 0 14px;border-bottom:1px solid var(--line)}.subtab{border:0;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);padding:10px 14px;font-weight:700}.subtab.active{color:var(--text);background:var(--panel);border-bottom:2px solid var(--blue)}.league-view,.team-view,.luck-view{display:none}.league-view.active,.team-view.active,.luck-view.active{display:block}#standingsTable th,#standingsTable td,#powerTable th,#powerTable td{text-align:right}#standingsTable th:nth-child(2),#standingsTable td:nth-child(2),#powerTable th:nth-child(2),#powerTable td:nth-child(2){text-align:left;white-space:nowrap}#standingsTable th:nth-child(8),#standingsTable td:nth-child(8),#standingsTable th:nth-child(9),#standingsTable td:nth-child(9){text-align:center}.standings-value{font-weight:700}.sortable{cursor:pointer;user-select:none}.sortable:hover{color:var(--text)}.power-highlight{text-align:center;min-height:22px;color:var(--muted);font-weight:700}.model-details{margin:4px 0 14px;color:var(--muted);font-size:13px}.model-details summary{display:inline-block;color:var(--blue);cursor:pointer;font-weight:650}.model-details p{max-width:900px;line-height:1.5;margin:8px 0 0}.live-team-name{text-align:center;font-size:clamp(20px,3vw,30px);font-weight:800;line-height:1.2;padding:8px 4px;color:var(--text)}.live-team-bottom{padding-top:0}.bracket-scroll{overflow-x:auto;padding:2px 0 10px}.bracket{display:flex;gap:16px;min-width:max-content;align-items:flex-start}.bracket-round{width:250px;display:flex;flex-direction:column;gap:12px}.bracket-round h3{font-size:14px;margin:0;color:var(--muted)}.bracket-round.bracket-final{align-self:center}.bracket-match{border:1px solid var(--line);background:var(--bg);border-radius:10px;overflow:hidden}.bracket-side{padding:9px 11px;border-bottom:1px solid var(--line);font-size:13px}.bracket-side:last-child{border-bottom:0}.bracket-side.muted{color:var(--muted)}</style>
+<style>.power-team-dot{display:inline-block;width:12px;height:12px;border-radius:50%;box-shadow:0 0 8px currentColor}.leaderboard-badge-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px;align-items:center;justify-items:center;margin:14px 0}.leaderboard-badge{--accent:#f5a623;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:7px;width:min(100%,260px);aspect-ratio:1;border-radius:50%;padding:22px;background:radial-gradient(circle at 35% 25%,color-mix(in srgb,var(--accent),transparent 75%),transparent 50%),linear-gradient(145deg,#202a36,#10161e);border:2px solid color-mix(in srgb,var(--accent),white 15%);box-shadow:0 0 0 6px color-mix(in srgb,var(--accent),transparent 88%),0 12px 28px #0008}.leaderboard-badge .icon{font-size:34px}.leaderboard-badge .title{color:var(--accent);font-weight:850;letter-spacing:.06em;text-transform:uppercase}.leaderboard-badge .team{font-size:32px;font-weight:900}.leaderboard-badge .metric{font-size:12px;color:#c9d4de}.leaderboard-last .leaderboard-badge{--accent:#f06a6a;width:min(75%,190px);background:radial-gradient(circle at 35% 25%,rgba(248,81,73,.18),transparent 50%),linear-gradient(145deg,#321d22,#1a1318);box-shadow:0 0 0 4px rgba(248,81,73,.08),0 8px 20px #0007}.leaderboard-last .icon{font-size:28px}.leaderboard-last .team{font-size:26px}@media(max-width:900px){.leaderboard-badge-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.leaderboard-badge-grid{grid-template-columns:1fr}}</style>
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
 </style></head><body><main class="wrap">
 <h1>Fielding of (football) dreams</h1><div class="sub" id="subtitle"></div>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
-<button class="tab active" data-tab="team" role="tab" aria-selected="true">Team Stats</button><button class="tab" data-tab="league" role="tab" aria-selected="false">League Stats</button><button class="tab" data-tab="leaderboard" role="tab" aria-selected="false">Leaderboard</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button></nav>
+<button class="tab active" data-tab="league" role="tab" aria-selected="true">League Stats</button><button class="tab" data-tab="team" role="tab" aria-selected="false">Team Stats</button><button class="tab" data-tab="luck" role="tab" aria-selected="false">Luck</button><button class="tab" data-tab="live" role="tab" aria-selected="false">Live Win %</button><button class="tab" data-tab="trades" role="tab" aria-selected="false">Trades</button><button class="tab" data-tab="leaderboard" role="tab" aria-selected="false">Leaderboard</button></nav>
 
-<section class="panel active" id="panel-team" role="tabpanel">
+<section class="panel active" id="panel-league" role="tabpanel">
+<div class="subtabs" role="tablist" aria-label="League statistics"><button class="subtab league-subtab active" type="button" data-league-view="standings" aria-selected="true">Standings</button><button class="subtab league-subtab" type="button" data-league-view="power" aria-selected="false">Power Rankings</button><button class="subtab league-subtab" type="button" data-league-view="playoffs" aria-selected="false">Playoff Bracket</button></div>
+<section class="league-view active" id="league-view-standings"><article class="card"><h2>League Standings</h2><p>Completed regular-season record, points for, points against, and point differential. Points columns use a red-to-green scale centered on the league average.</p><div class="scroll"><table id="standingsTable"></table></div></article></section>
+<section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><div class="chartbox"><canvas id="powerHistoryChart"></canvas></div><div id="powerHighlight" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="toolbar"><span>Week:</span><div id="powerWeeks" class="team-buttons" aria-label="Choose power ranking week"></div></div><div class="scroll"><table id="powerTable"></table></div></article></section>
+<section class="league-view" id="league-view-playoffs"><article class="card"><h2>Playoff Bracket If the Season Ended Today</h2><p id="playoffBracketNote">Projected seeds use current standings, including live regular-season scores when available.</p><h3>Winners Bracket</h3><div id="playoffBracket" class="bracket-scroll"></div></article></section>
+</section>
+
+<section class="panel" id="panel-team" role="tabpanel">
 <div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="starters" aria-selected="false">Starters vs. Bench</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
 <section class="team-view active" id="team-view-position">
-<article class="card"><h2>Season points by position</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
-<article class="card"><h2>Weekly points by position</h2><p>All available weeks for one team. Each bar is stacked by the six positions.</p><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
+<article class="card"><h2>6-axis position breakdown</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
+<article class="card"><h2>Total points by position</h2><div class="scroll"><table id="positionTotalsTable"></table></div></article>
+<article class="card"><h2>Total points by position · all teams</h2><div class="chartbox"><canvas id="positionTotalsChart"></canvas></div></article>
+<article class="card"><h2>Weekly points by position</h2><div class="toolbar"><span>Team:</span><div id="positionTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="positionChart"></canvas></div></article>
 </section>
-<section class="team-view" id="team-view-acquisition"><article class="card"><h2>Weekly points by acquisition</h2><p>Starter points are grouped using ESPN roster tags, draft picks, and accepted trade history. If ESPN omits an acquisition tag and neither the draft nor trade records identify it, the player is counted under waivers/free agency.</p><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article><article class="card"><h2>Total points by acquisition · all teams</h2><div class="chartbox"><canvas id="sourceTotalsChart"></canvas></div></article></section>
-<section class="team-view" id="team-view-starters"><article class="card"><h2>Starter and bench summary · all teams</h2><div class="scroll"><table id="starterBenchTable"></table></div></article><article class="card"><h2>Starter and bench points · all teams</h2><div class="chartbox"><canvas id="starterBenchChart"></canvas></div></article><article class="card"><h2>Points left on the bench per game · all teams</h2><div class="chartbox"><canvas id="benchLossChart"></canvas></div></article></section>
+<section class="team-view" id="team-view-acquisition"><article class="card"><h2>Total points by acquisition</h2><div class="scroll"><table id="sourceTotalsTable"></table></div></article><article class="card"><h2>Total points by acquisition · all teams</h2><div class="chartbox"><canvas id="sourceTotalsChart"></canvas></div></article><article class="card"><h2>Weekly points by acquisition</h2><div class="toolbar"><span>Team:</span><div id="sourceTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="sourceChart"></canvas></div></article></section>
+<section class="team-view" id="team-view-starters"><article class="card"><h2>Starter lineup summary · all teams</h2><div class="scroll"><table id="starterBenchTable"></table></div></article><article class="card"><h2>Actual vs. Optimal Lineup Points</h2><div class="chartbox"><canvas id="actualOptimalChart"></canvas></div></article><article class="card"><h2>Points left on the bench per game · all teams</h2><div class="chartbox"><canvas id="benchLossChart"></canvas></div></article></section>
 <section class="team-view" id="team-view-differential">
 <article class="card"><h2>Win/Loss Differential</h2><p>Weekly points scored minus points allowed. Wins are green and losses are red; bars are centered at zero.</p><div class="toolbar"><span>Team:</span><div id="differentialTeams" class="team-buttons" aria-label="Choose team"></div></div><div class="chartbox"><canvas id="differentialChart"></canvas></div></article>
 <article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
 </section>
-</section>
-
-<section class="panel" id="panel-league" role="tabpanel">
-<div class="subtabs" role="tablist" aria-label="League statistics"><button class="subtab league-subtab active" type="button" data-league-view="standings" aria-selected="true">Standings</button><button class="subtab league-subtab" type="button" data-league-view="power" aria-selected="false">Power Rankings</button><button class="subtab league-subtab" type="button" data-league-view="playoffs" aria-selected="false">Playoff Bracket</button></div>
-<section class="league-view active" id="league-view-standings"><article class="card"><h2>League Standings</h2><p>Completed regular-season record, points for, points against, and point differential. Points columns use a red-to-green scale centered on the league average.</p><div class="scroll"><table id="standingsTable"></table></div></article></section>
-<section class="league-view" id="league-view-power"><article class="card"><h2>Power Rankings</h2><div class="chartbox power-chartbox"><canvas id="powerHistoryChart"></canvas></div><div id="powerHighlight" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="toolbar"><span>Week:</span><div id="powerWeeks" class="team-buttons" aria-label="Choose power ranking week"></div></div><div class="scroll"><table id="powerTable"></table></div></article></section>
-<section class="league-view" id="league-view-playoffs"><article class="card"><h2>Playoff Bracket If the Season Ended Today</h2><p id="playoffBracketNote">Projected seeds use current standings, including live regular-season scores when available.</p><h3>Winners Bracket</h3><div id="playoffBracket" class="bracket-scroll"></div></article></section>
-</section>
-
-<section class="panel" id="panel-leaderboard" role="tabpanel">
-<article class="card"><h2>League Leaderboard</h2><div class="leaderboard-grid"><div id="leaderboardBadges" class="leaderboard-row"></div><div id="leaderboardLastBadges" class="leaderboard-row leaderboard-last-row"></div></div></article>
 </section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
@@ -1149,11 +1054,9 @@ def _html(payload):
 </section>
 <section class="luck-view" id="luck-view-clutch"><article class="card"><h2>Clutch Rating</h2><div class="chartbox"><canvas id="clutchChart"></canvas></div></article></section>
 <section class="luck-view" id="luck-view-multiverse">
-<article class="card"><h2>Actual Wins Compared with the Schedule Multiverse</h2><div class="scroll"><table id="multiverseSummaryTable"></table></div></article>
 <article class="card"><h2>Fantasy Multiverse</h2><p>Win distributions compare each team’s actual weekly scores against 20,000 sampled valid schedules. Teams face every opponent once, then repeat the same early-season opponents for the remaining regular-season weeks.</p><div class="toolbar"><span>Team:</span><div id="multiverseTeams" class="team-buttons" aria-label="Choose multiverse team"></div><span id="multiverseTeamLabel" class="muted"></span></div><div class="chartbox"><canvas id="multiverseTeamChart"></canvas></div></article>
 <article class="card"><h2>All Teams’ Win Distributions</h2><div id="multiverseAllLabel" class="power-highlight">Hover over or click a line to highlight a team.</div><div class="chartbox"><canvas id="multiverseAllChart"></canvas></div></article>
 <article class="card"><h2>First Place Across Schedules</h2><div class="chartbox"><canvas id="multiverseFirstPie"></canvas></div></article>
-<article class="card"><h2>Playoff Titles Across Schedules</h2><div id="multiversePlayoffNote" class="muted"></div><div class="chartbox"><canvas id="multiversePlayoffPie"></canvas></div></article>
 </section>
 </section>
 
@@ -1164,6 +1067,7 @@ def _html(payload):
 <section class="panel" id="panel-trades" role="tabpanel">
 <article class="card"><h2>Trades by team</h2><p>Accepted trades involving the selected team, with post-trade player points and an individual trade rating.</p><div class="toolbar"><span>Team:</span><div id="tradeTeams" class="team-buttons" aria-label="Choose team"></div><span id="teamRating"></span></div><div id="tradeNotice" class="notice" style="display:none"></div><h3 id="teamTradeTitle"></h3><div class="team-trade-chart"><canvas id="teamTradeChart"></canvas></div><div id="teamTrades"></div></article>
 </section>
+<section class="panel" id="panel-leaderboard" role="tabpanel"><article class="card"><h2>Leaderboard</h2><div class="leaderboard-badge-grid" id="leaderboardWinners"></div><div class="leaderboard-badge-grid leaderboard-last" id="leaderboardLast"></div></article></section>
 <div class="sub" id="updated"></div>
 </main><script>
 const D=__DATA__;
@@ -1176,35 +1080,38 @@ function teamAbbrev(team){const exact=D.team_abbrevs?.[team];if(exact)return exa
 function fillTeamButtons(id,onChange,initial=D.teams[0]){const host=document.getElementById(id);const buttons=new Map();let selected=initial;D.teams.forEach(team=>{const b=document.createElement('button');b.type='button';b.className='team-button';b.textContent=teamAbbrev(team);b.title=team;b.setAttribute('aria-label',team);b.setAttribute('aria-pressed','false');b.addEventListener('click',()=>choose(team));host.append(b);buttons.set(team,b);});function choose(team){selected=team;buttons.forEach((b,n)=>{const active=n===team;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));});onChange(team);}choose(selected);return{value:()=>selected,choose};}
 document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>{const active=x===btn;x.classList.toggle('active',active);x.setAttribute('aria-selected',active)});document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+btn.dataset.tab));requestAnimationFrame(()=>document.querySelectorAll('.panel.active canvas').forEach(c=>Chart.getChart(c)?.resize()));}));
 const radars=document.getElementById('radars');const maxima=D.groups.map(g=>Math.max(1,...D.teams.map(t=>D.position_totals[t][g]||0)));const normalized=a=>a.map((v,i)=>100*v/maxima[i]);
-D.teams.forEach((team,i)=>{const cell=document.createElement('div');cell.className='rcell';const title=document.createElement('h3');title.textContent=teamAbbrev(team);title.title=team;const box=document.createElement('div');box.className='rbox';const cv=document.createElement('canvas');box.append(cv);cell.append(title,box);radars.append(cell);new Chart(cv,{type:'radar',data:{labels:D.groups.map((g,j)=>[g,'(max '+maxima[j].toFixed(0)+')']),datasets:[{label:teamAbbrev(team),data:normalized(D.groups.map(g=>D.position_totals[team][g]||0)),borderColor:colors[0],backgroundColor:'rgba(77,163,255,.28)',borderWidth:2},{label:'League avg',data:normalized(D.groups.map(g=>D.teams.reduce((s,t)=>s+(D.position_totals[t][g]||0),0)/D.teams.length)),borderColor:'#8b98a5',borderDash:[5,4],backgroundColor:'transparent',pointRadius:0}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:()=>team,label:c=>c.dataset.label+': '+(c.datasetIndex===0?(D.position_totals[team][D.groups[c.dataIndex]]||0):(D.teams.reduce((s,t)=>s+(D.position_totals[t][D.groups[c.dataIndex]]||0),0)/D.teams.length)).toFixed(1)+' pts'}}},scales:{r:{min:0,max:100,ticks:{display:false},grid:{color:'#243040'},angleLines:{color:'#243040'}}}}});});
+D.teams.forEach((team,i)=>{const cell=document.createElement('div');cell.className='rcell';const title=document.createElement('h3');title.textContent=team;const box=document.createElement('div');box.className='rbox';const cv=document.createElement('canvas');box.append(cv);cell.append(title,box);radars.append(cell);new Chart(cv,{type:'radar',data:{labels:D.groups.map((g,j)=>[g,'(max '+maxima[j].toFixed(0)+')']),datasets:[{label:team,data:normalized(D.groups.map(g=>D.position_totals[team][g]||0)),borderColor:colors[0],backgroundColor:'rgba(77,163,255,.28)',borderWidth:2},{label:'League avg',data:normalized(D.groups.map(g=>D.teams.reduce((s,t)=>s+(D.position_totals[t][g]||0),0)/D.teams.length)),borderColor:'#8b98a5',borderDash:[5,4],backgroundColor:'transparent',pointRadius:0}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.dataset.label+': '+(c.datasetIndex===0?(D.position_totals[team][D.groups[c.dataIndex]]||0):(D.teams.reduce((s,t)=>s+(D.position_totals[t][D.groups[c.dataIndex]]||0),0)/D.teams.length)).toFixed(1)+' pts'}}},scales:{r:{min:0,max:100,ticks:{display:false},grid:{color:'#243040'},angleLines:{color:'#243040'}}}}});});
 
 const positionGroups=['DEF',...D.groups.filter(group=>group!=='DEF')];
 const positionRows=D.teams.flatMap(team=>D.weekly_positions[team]||[]);
 const positionAxisMax=Math.max(20,Math.ceil(Math.max(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.max(0,Number(row[group]||0)),0)))/20)*20);
 const positionAxisMin=Math.min(0,Math.floor(Math.min(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.min(0,Number(row[group]||0)),0)))/20)*20);
+function renderSortableStatsTable(id,columns,rows){const table=document.getElementById(id);let sortKey=columns[0].key,direction=1;function draw(){const ordered=[...rows].sort((a,b)=>{const left=a[sortKey],right=b[sortKey];return (typeof left==='number'&&typeof right==='number'?direction*(left-right):direction*String(left??'').localeCompare(String(right??'')))||String(a.team).localeCompare(String(b.team));});table.replaceChildren();const head=document.createElement('tr');columns.forEach(column=>{const th=document.createElement('th');th.className='sortable';th.textContent=column.label+(column.key===sortKey?(direction<0?' ▼':' ▲'):'');th.title='Sort by '+column.label;th.addEventListener('click',()=>{if(sortKey===column.key)direction*=-1;else{sortKey=column.key;direction=column.key==='team'?1:-1;}draw();});head.append(th);});table.append(head);ordered.forEach(row=>{const tr=document.createElement('tr');columns.forEach(column=>{const td=document.createElement('td');td.textContent=column.render?column.render(row):row[column.key];if(column.key==='team')td.title=row.team;tr.append(td);});table.append(tr);});}draw();}
+const positionStatRows=D.teams.map(team=>{const played=(D.weekly_positions[team]||[]).filter(row=>positionGroups.reduce((sum,group)=>sum+Math.abs(Number(row[group]||0)),0)>0).length||1;const row={team};positionGroups.forEach(group=>{row[group]=Number(D.position_totals[team]?.[group]||0);row[group+'_display']=`${row[group].toFixed(1)} (${(row[group]/played).toFixed(1)} PPG)`;});return row;});
+renderSortableStatsTable('positionTotalsTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},...positionGroups.map(group=>({key:group,label:group,render:row=>row[group+'_display']}))],positionStatRows);
+new Chart(document.getElementById('positionTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:positionGroups.map(group=>({label:group,data:D.teams.map(team=>Number(D.position_totals[team]?.[group]||0)),backgroundColor:colors[D.groups.indexOf(group)]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}},},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 const posChart=new Chart(document.getElementById('positionChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:positionGroups.map((g)=>({label:g,data:[],backgroundColor:colors[D.groups.indexOf(g)]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
-function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=teamAbbrev(t);posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[positionGroups[i]]||0));posChart.update();}
+function showPosition(t){const rows=D.weekly_positions[t]||[];posChart.options.plugins.title.text=t;posChart.data.datasets.forEach((ds,i)=>ds.data=rows.map(r=>r[positionGroups[i]]||0));posChart.update();}
 const positionButtons=fillTeamButtons('positionTeams',showPosition);
 const sourceColors={Drafted:'#4da3ff',Traded:'#da70d6',Waivers:'#f5a623',Unknown:'#8b98a5'};
-const sourceRows=D.teams.flatMap(team=>D.weekly_sources[team]||[]),sourceTotalsByWeek=sourceRows.map(row=>D.sources.reduce((sum,source)=>sum+Number(row[source]||0),0)),sourceMin=Math.min(0,...sourceRows.map(row=>D.sources.reduce((sum,source)=>sum+Math.min(0,Number(row[source]||0)),0))),sourceAxisMin=sourceMin<0?Math.floor(sourceMin/20)*20:0,sourceAxisMax=Math.max(20,Math.ceil(Math.max(0,...sourceTotalsByWeek)/20)*20);
-const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:sourceAxisMin,max:sourceAxisMax,title:{display:true,text:'Fantasy points'}}}}});
-function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=teamAbbrev(team);sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
+const sourceStatRows=D.teams.map(team=>({team,...Object.fromEntries(D.sources.map(source=>[source,Number(D.source_totals?.[team]?.[source]||0)]))}));
+renderSortableStatsTable('sourceTotalsTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},...D.sources.map(source=>({key:source,label:source,render:row=>row[source].toFixed(1)}))],sourceStatRows);
+new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:D.sources.map(source=>({label:source,data:D.teams.map(team=>Number(D.source_totals?.[team]?.[source]||0)),backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
+const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
+function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=team;sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
 const sourceButtons=fillTeamButtons('sourceTeams',showSource);
-const sourceTotals=new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:D.sources.map(source=>({label:source,data:D.teams.map(team=>(D.weekly_sources[team]||[]).reduce((sum,row)=>sum+Number(row[source]||0),0)),backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{title:{display:true,text:'All teams · total starter points'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}},legend:{position:'bottom'}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
-const starterBenchData=D.starter_bench_totals||{},starterTotals=D.teams.map(team=>Number(starterBenchData[team]?.starters||0)),benchTotals=D.teams.map(team=>-Number(starterBenchData[team]?.bench||0)),starterBenchMin=Math.min(0,...benchTotals),starterBenchMax=Math.max(0,...starterTotals);
-const starterBenchTable=document.getElementById('starterBenchTable'),starterBenchRows=D.teams.map(team=>({team,starters:Number(starterBenchData[team]?.starters||0),bench:Number(starterBenchData[team]?.bench||0),efficiency:Number(starterBenchData[team]?.efficiency||0)}));let starterBenchSort='efficiency',starterBenchDirection=-1;
-function renderStarterBenchTable(){starterBenchTable.replaceChildren();const header=document.createElement('tr');[['Team','team'],['Actual starter points','starters'],['Bench points','bench'],['% of maximum scored','efficiency']].forEach(([label,key])=>{const th=document.createElement('th');th.textContent=label+(key===starterBenchSort?(starterBenchDirection<0?' ▼':' ▲'):'');th.className='sortable';th.setAttribute('aria-sort',key===starterBenchSort?(starterBenchDirection<0?'descending':'ascending'):'none');th.addEventListener('click',()=>{if(starterBenchSort===key)starterBenchDirection*=-1;else{starterBenchSort=key;starterBenchDirection=key==='team'?1:-1;}renderStarterBenchTable();});header.append(th);});starterBenchTable.append(header);const rows=[...starterBenchRows].sort((a,b)=>starterBenchSort==='team'?starterBenchDirection*a.team.localeCompare(b.team):starterBenchDirection*(a[starterBenchSort]-b[starterBenchSort]));const efficiencyValues=starterBenchRows.map(row=>row.efficiency);rows.forEach(row=>{const tr=document.createElement('tr'),teamCell=document.createElement('td');teamCell.textContent=teamAbbrev(row.team);teamCell.title=row.team;tr.append(teamCell);[row.starters.toFixed(1),row.bench.toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});const eff=document.createElement('td');eff.textContent=row.efficiency.toFixed(1)+'%';eff.className='standings-value';eff.style.color=colorByLeagueAverage(row.efficiency,efficiencyValues);tr.append(eff);starterBenchTable.append(tr);});}
-renderStarterBenchTable();
-new Chart(document.getElementById('starterBenchChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Starters',data:starterTotals,backgroundColor:'#4da3ff',borderRadius:3,stack:'points'},{label:'Bench',data:benchTotals,backgroundColor:'#f5a623',borderRadius:3,stack:'points'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'bottom',labels:{filter:item=>item.text!=='0 points'}},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:'',label:item=>item.dataset.label==='Bench'?`Bench: ${Math.abs(item.raw).toFixed(1)} pts`:`${item.dataset.label}: ${item.raw.toFixed(1)} pts`}}},scales:{x:{stacked:true},y:{stacked:true,min:starterBenchMin<0?starterBenchMin*1.04:0,max:starterBenchMax>0?starterBenchMax*1.04:1,ticks:{callback:value=>Math.abs(Number(value)).toLocaleString()},title:{display:true,text:'Fantasy points (bench shown below zero)'}}}}});
-const benchLostValues=D.teams.map(team=>Number(D.bench_points_lost_ppg?.[team]||0)),benchLostBound=Math.max(1,Math.max(...benchLostValues)*1.08);
-new Chart(document.getElementById('benchLossChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Points left on bench per game',data:benchLostValues,backgroundColor:'#4da3ff',borderRadius:3}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{ticks:{maxRotation:45,minRotation:0}},y:{beginAtZero:true,max:benchLostBound,title:{display:true,text:'Points left on bench per game'}}}}});
-const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom',labels:{filter:item=>item.text!=='0 points'}}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
-function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),min=Math.min(0,...values),max=Math.max(0,...values);differentialChart.options.plugins.title.text='Win/Loss Differential by week · '+teamAbbrev(team);differentialChart.options.scales.y.min=min<0?min*1.04:0;differentialChart.options.scales.y.max=max>0?max*1.04:1;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
+const starterBenchRows=D.teams.map(team=>({team,...(D.starter_bench_totals?.[team]||{actual:0,bench:0,optimal:0,left:0,left_ppg:0,actual_ppg:0,optimal_ppg:0,games:0})}));
+renderSortableStatsTable('starterBenchTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},{key:'actual',label:'Actual points (PPG)',render:row=>`${row.actual.toFixed(1)} (${row.actual_ppg.toFixed(1)})`},{key:'bench',label:'Bench points',render:row=>row.bench.toFixed(1)},{key:'optimal',label:'Optimal lineup points (PPG)',render:row=>`${row.optimal.toFixed(1)} (${row.optimal_ppg.toFixed(1)})`},{key:'left_ppg',label:'PPG left on bench',render:row=>row.left_ppg.toFixed(2)}],starterBenchRows);
+new Chart(document.getElementById('actualOptimalChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Actual points',data:starterBenchRows.map(row=>row.actual),backgroundColor:'#4da3ff'},{label:'Optimal lineup points',data:starterBenchRows.map(row=>row.optimal),backgroundColor:'#f5a623'}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{},y:{beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
+const benchLossMax=Math.max(0,...starterBenchRows.map(row=>row.left_ppg));
+new Chart(document.getElementById('benchLossChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Points left on bench per game',data:starterBenchRows.map(row=>row.left_ppg),backgroundColor:'#4da3ff'}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{},y:{beginAtZero:true,max:benchLossMax?benchLossMax*1.08:1,title:{display:true,text:'Points per game'}}}}});
+const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
+function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+team;differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
 const winDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='W');return rows.length?rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
 const lossDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='L');return rows.length?-rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
-const overallDiffMin=Math.min(0,...lossDiffTotals),overallDiffMax=Math.max(0,...winDiffTotals);
-new Chart(document.getElementById('overallDifferentialChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Point differential in wins',data:winDiffTotals,backgroundColor:'#3fb950',borderRadius:3,stack:'differential'},{label:'Point differential in losses',data:lossDiffTotals,backgroundColor:'#f85149',borderRadius:3,stack:'differential'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{filter:item=>item.text!=='0 points'}},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true,ticks:{maxRotation:45,minRotation:0}},y:{stacked:true,min:overallDiffMin<0?overallDiffMin*1.04:0,max:overallDiffMax>0?overallDiffMax*1.04:1,title:{display:true,text:'Point differential'},ticks:{precision:0}}}}});
+const overallDiffBound=Math.max(1,...winDiffTotals.map(Math.abs),...lossDiffTotals.map(Math.abs));
+new Chart(document.getElementById('overallDifferentialChart'),{type:'bar',data:{labels:D.teams,datasets:[{label:'Point differential in wins',data:winDiffTotals,backgroundColor:'#3fb950',borderRadius:3,stack:'differential'},{label:'Point differential in losses',data:lossDiffTotals,backgroundColor:'#f85149',borderRadius:3,stack:'differential'},{type:'line',label:'0 points',data:D.teams.map(()=>0),borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'}},scales:{x:{stacked:true,ticks:{maxRotation:45,minRotation:0}},y:{stacked:true,min:-overallDiffBound,max:overallDiffBound,title:{display:true,text:'Point differential'},ticks:{precision:0}}}}});
 
 const standingsTable=document.getElementById('standingsTable');
 function appendTableHeader(table,labels){const tr=document.createElement('tr');labels.forEach(label=>{const th=document.createElement('th');th.textContent=label;tr.append(th);});table.append(tr);}
@@ -1217,7 +1124,7 @@ function renderStandings(){
   const rows=[...D.standings].sort((a,b)=>standingsSort==='wins'?(Number(a.espn_rank||999)-Number(b.espn_rank||999)):direction*(Number(a[key]||0)-Number(b[key]||0))||a.team.localeCompare(b.team));
   standingsTable.replaceChildren();const header=document.createElement('tr');
   [['Rank',null],['Team',null],...Object.entries(sortLabels).map(([k,label])=>[label,k])].forEach(([label,k])=>{const th=document.createElement('th');th.textContent=label+(k===standingsSort?(direction<0?' ▼':' ▲'):'');if(k){th.className='sortable';th.setAttribute('aria-sort',k===standingsSort?(direction<0?'descending':'ascending'):'none');th.title=k==='wins'?'Sort by ESPN standings order, including league tiebreakers':'Sort by '+label;th.addEventListener('click',()=>{if(k==='wins'){standingsSort='wins';standingsDirection=-1;}else if(standingsSort===k)standingsDirection*=-1;else{standingsSort=k;standingsDirection=defaultSortDirection[k];}renderStandings();});}header.append(th);});standingsTable.append(header);
-  rows.forEach((row,index)=>{const tr=document.createElement('tr');[index+1,teamAbbrev(row.team),row.wins,row.losses,row.ties,Number(row.pct||0).toFixed(3),row.games_back===0?'—':Number(row.games_back||0).toFixed(1)].forEach((value,column)=>{const td=document.createElement('td');td.textContent=value;if(column===1)td.title=row.team;tr.append(td);});
+  rows.forEach((row,index)=>{const tr=document.createElement('tr');[index+1,row.team,row.wins,row.losses,row.ties,Number(row.pct||0).toFixed(3),row.games_back===0?'—':Number(row.games_back||0).toFixed(1)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});
     const games=Number(row.games||0),pf=Number(row.points_for||0),pa=Number(row.points_against||0),diff=Number(row.point_diff||0);
     [[pf,'points_for',false],[pa,'points_against',true],[diff,'point_diff',false]].forEach(([value,metric,invert])=>{const td=document.createElement('td');td.className='standings-value';td.textContent=metric==='point_diff'?value.toFixed(1):`${value.toFixed(1)} (${games?(value/games).toFixed(1):'0.0'})`;const values=D.standings.map(r=>Number(r[metric]||0));td.style.color=colorByLeagueAverage(invert?-value:value,invert?values.map(v=>-v):values);tr.append(td);});
     standingsTable.append(tr);
@@ -1225,30 +1132,22 @@ function renderStandings(){
 }
 renderStandings();
 
-const leaderboardHost=document.getElementById('leaderboardBadges'),leaderboardLastHost=document.getElementById('leaderboardLastBadges');
-const seasonByTeam=new Map((D.season||[]).map(row=>[row.team,row]));
-const tradeRatingByName=new Map((D.trade_ratings||[]).map(row=>[row.team,row]));
-const leaderboardEntries=[
-  {title:'Highest Scoring',lastTitle:'Anemic',icon:'🏆',accent:'#f5c451',metric:value=>`${value.toFixed(1)} points scored`,value:team=>Number(D.standings.find(row=>row.team===team)?.points_for||0),best:'max'},
-  {title:'Luckiest',lastTitle:'Hated by God',icon:'🍀',accent:'#58d68d',metric:value=>`${value>=0?'+':''}${value.toFixed(2)} schedule luck`,value:team=>Number(seasonByTeam.get(team)?.luck||0),best:'max'},
-  {title:'COTY',lastTitle:'Loser of Men',icon:'🧠',accent:'#65b8ff',metric:value=>`${value.toFixed(2)} PPG left on the bench`,value:team=>Number(D.bench_points_lost_ppg?.[team]||0),best:'min'},
-  {title:'GM of the Year',lastTitle:'Fleeced 24/7',icon:'🤝',accent:'#d58bff',metric:value=>`${value>=0?'+':''}${value.toFixed(2)} trade points per week`,value:team=>Number(tradeRatingByName.get(team)?.score||0),best:'max'},
+const leaderboardWinnerHost=document.getElementById('leaderboardWinners'),leaderboardLastHost=document.getElementById('leaderboardLast'),seasonLookup=new Map((D.season||[]).map(row=>[row.team,row])),tradeLookup=new Map((D.trade_ratings||[]).map(row=>[row.team,row]));
+const leaderboardCategories=[
+  {title:'Highest Scoring',last:'Anemic',icon:'🏆',value:team=>Number(D.standings.find(row=>row.team===team)?.points_for||0),metric:v=>`${v.toFixed(1)} points scored`,best:'max',accent:'#f5c451'},
+  {title:'Luckiest',last:'Hated by God',icon:'🍀',value:team=>Number(seasonLookup.get(team)?.luck||0),metric:v=>`${v>=0?'+':''}${v.toFixed(2)} schedule luck`,best:'max',accent:'#58d68d'},
+  {title:'COTY',last:'Loser of Men',icon:'🧠',value:team=>Number(D.starter_bench_totals?.[team]?.left_ppg||0),metric:v=>`${v.toFixed(2)} PPG left on the bench`,best:'min',accent:'#65b8ff'},
+  {title:'GM of the Year',last:'Fleeced 24/7',icon:'🤝',value:team=>Number(tradeLookup.get(team)?.score||0),metric:v=>`${v>=0?'+':''}${v.toFixed(2)} trade points/week`,best:'max',accent:'#d58bff'},
 ];
-leaderboardEntries.forEach(entry=>{
-  const candidates=D.teams.map(team=>({team,value:entry.value(team)}));
-  candidates.sort((a,b)=>(entry.best==='min'?a.value-b.value:b.value-a.value)||D.teams.indexOf(a.team)-D.teams.indexOf(b.team));
-  const winner=candidates[0],last=candidates[candidates.length-1];
-  const makeBadge=(result,label,iconText,accent,host)=>{const badge=document.createElement('div');badge.className='leaderboard-badge';badge.style.setProperty('--badge-accent',accent);badge.title=result.team;const icon=document.createElement('div');icon.className='leaderboard-icon';icon.textContent=iconText;const title=document.createElement('div');title.className='leaderboard-title';title.textContent=label;const team=document.createElement('div');team.className='leaderboard-team';team.textContent=teamAbbrev(result.team);const metric=document.createElement('div');metric.className='leaderboard-metric';metric.textContent=entry.metric(result.value);badge.append(icon,title,team,metric);host.append(badge);};
-  makeBadge(winner,entry.title,entry.icon,entry.accent,leaderboardHost);
-  makeBadge(last,entry.lastTitle,'💩','#f06a6a',leaderboardLastHost);
-});
+function drawLeaderboardBadge(host,category,result,label,icon,accent){const badge=document.createElement('div');badge.className='leaderboard-badge';badge.style.setProperty('--accent',accent);badge.title=result.team;const iconNode=document.createElement('div');iconNode.className='icon';iconNode.textContent=icon;const titleNode=document.createElement('div');titleNode.className='title';titleNode.textContent=label;const teamNode=document.createElement('div');teamNode.className='team';teamNode.textContent=teamAbbrev(result.team);const metricNode=document.createElement('div');metricNode.className='metric';metricNode.textContent=category.metric(result.value);badge.append(iconNode,titleNode,teamNode,metricNode);host.append(badge);}
+leaderboardCategories.forEach(category=>{const ranked=D.teams.map(team=>({team,value:category.value(team)}));ranked.sort((a,b)=>(category.best==='min'?a.value-b.value:b.value-a.value)||D.teams.indexOf(a.team)-D.teams.indexOf(b.team));drawLeaderboardBadge(leaderboardWinnerHost,category,ranked[0],category.title,category.icon,category.accent);drawLeaderboardBadge(leaderboardLastHost,category,ranked[ranked.length-1],category.last,'💩','#f06a6a');});
 
-const powerTable=document.getElementById('powerTable'),powerWeeksHost=document.getElementById('powerWeeks');appendTableHeader(powerTable,['Rank','Team','Score']);
-function renderPowerRankings(rows){powerTable.replaceChildren();appendTableHeader(powerTable,['Rank','Team','Score']);const scores=rows.map(row=>row.score);rows.forEach(row=>{const tr=document.createElement('tr');[row.rank,teamAbbrev(row.team),row.score.toFixed(1)].forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index===1)td.title=row.team;if(index===2){td.className='standings-value';td.style.color=colorByLeagueAverage(row.score,scores);}tr.append(td);});powerTable.append(tr);});}
+const powerTable=document.getElementById('powerTable'),powerWeeksHost=document.getElementById('powerWeeks'),powerColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(1,D.teams.length))} 78% 58%)`);appendTableHeader(powerTable,['Rank','Team','Score','Team Color']);
+function renderPowerRankings(rows){powerTable.replaceChildren();appendTableHeader(powerTable,['Rank','Team','Score','Team Color']);const scores=rows.map(row=>row.score);rows.forEach(row=>{const tr=document.createElement('tr');[row.rank,row.team,row.score.toFixed(1)].forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index===2){td.className='standings-value';td.style.color=colorByLeagueAverage(row.score,scores);}if(index===1)td.title=row.team;tr.append(td);});const colorCell=document.createElement('td');colorCell.style.textAlign='right';const dot=document.createElement('span');dot.className='power-team-dot';const teamIndex=D.teams.indexOf(row.team);dot.style.backgroundColor=powerColors[teamIndex];dot.title=row.team+' line color';dot.setAttribute('aria-label',row.team+' line color');colorCell.append(dot);tr.append(colorCell);powerTable.append(tr);});}
 const powerHistory=D.power_history||[];const powerChoices=[...powerHistory,{week:'Current',teams:D.power_rankings}];
 powerChoices.forEach((entry,index)=>makeChoiceButton(powerWeeksHost,entry.week==='Current'?'Current':'W'+entry.week,'Power rankings after week '+entry.week,index===powerChoices.length-1,()=>{[...powerWeeksHost.children].forEach((button,i)=>{const active=i===index;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});renderPowerRankings(entry.teams);}));renderPowerRankings(D.power_rankings);
-const powerColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(1,D.teams.length))} 78% 58%)`),powerHighlight=document.getElementById('powerHighlight');let pinnedPowerTeam=null;
-const powerChart=new Chart(document.getElementById('powerHistoryChart'),{type:'line',data:{labels:powerHistory.map(row=>'W'+row.week),datasets:D.teams.map((team,index)=>({label:teamAbbrev(team),data:powerHistory.map(week=>week.teams.find(row=>row.team===team)?.rank??null),borderColor:powerColors[index],backgroundColor:powerColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18,spanGaps:false}))},options:{maintainAspectRatio:false,layout:{padding:{left:0,right:0}},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?'Week '+powerHistory[items[0].dataIndex]?.week:'',label:item=>`${D.teams[item.datasetIndex]} · rank ${item.raw}`}}},scales:{y:{position:'left',reverse:true,min:1,max:D.teams.length,ticks:{stepSize:1,autoSkip:false,precision:0,padding:4},title:{display:true,text:'Power rank (1 is best)'}},x:{offset:false,title:{display:true,text:'Completed week'}}},onHover:(event,elements)=>{if(pinnedPowerTeam===null)highlightPowerTeam(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedPowerTeam=null;highlightPowerTeam(null);}else{pinnedPowerTeam=pinnedPowerTeam===index?null:index;highlightPowerTeam(pinnedPowerTeam);}}}});
+const powerHighlight=document.getElementById('powerHighlight');let pinnedPowerTeam=null;
+const powerChart=new Chart(document.getElementById('powerHistoryChart'),{type:'line',data:{labels:powerHistory.map(row=>'W'+row.week),datasets:D.teams.map((team,index)=>({label:team,data:powerHistory.map(week=>week.teams.find(row=>row.team===team)?.rank??null),borderColor:powerColors[index],backgroundColor:powerColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18,spanGaps:false}))},options:{maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?'Week '+powerHistory[items[0].dataIndex]?.week:'',label:item=>`${D.teams[item.datasetIndex]} · rank ${item.raw}`}}},scales:{y:{reverse:true,min:1,max:D.teams.length,ticks:{stepSize:1},title:{display:true,text:'Power rank (1 is best)'}},x:{title:{display:true,text:'Completed week'}}},onHover:(event,elements)=>{if(pinnedPowerTeam===null)highlightPowerTeam(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedPowerTeam=null;highlightPowerTeam(null);}else{pinnedPowerTeam=pinnedPowerTeam===index?null:index;highlightPowerTeam(pinnedPowerTeam);}}}});
 function highlightPowerTeam(index){powerChart.data.datasets.forEach((dataset,i)=>{dataset.borderColor=index===null?powerColors[i]:(i===index?powerColors[i]:'rgba(160,170,180,.18)');dataset.backgroundColor=dataset.borderColor;dataset.borderWidth=index===i?4:1.5;dataset.pointRadius=index===i?2:0;});powerHighlight.textContent=index===null?'Hover over or click a line to highlight a team.':D.teams[index];powerHighlight.style.color=index===null?'var(--muted)':powerColors[index];powerChart.update('none');}
 const playoffBracket=document.getElementById('playoffBracket'),playoffNote=document.getElementById('playoffBracketNote');
 function renderPlayoffBracket(){
@@ -1258,7 +1157,7 @@ function renderPlayoffBracket(){
   if(!D.playoff_team_count||!entrants.length){const p=document.createElement('p');p.className='muted';p.textContent='ESPN does not report playoff teams for this league.';playoffBracket.append(p);return;}
   let size=2;while(size<entrants.length)size*=2;
   let seedOrder=[1,2];for(let n=4;n<=size;n*=2)seedOrder=seedOrder.flatMap(seed=>[seed,n+1-seed]);
-  const bracketFullNames=new Map(),bySeed=new Map(entrants.map(row=>{const label=`#${row.seed} · ${teamAbbrev(row.team)} (${row.record})`;bracketFullNames.set(label,row.team);return[row.seed,label];}));
+  const bySeed=new Map(entrants.map(row=>[row.seed,`#${row.seed} · ${row.team} (${row.record})`]));
   let nodes=seedOrder.map(seed=>bySeed.get(seed)||null),roundIndex=0,gameNumber=1;const bracket=document.createElement('div');bracket.className='bracket';
   while(nodes.length>1){
     const matches=[],next=[];
@@ -1270,7 +1169,7 @@ function renderPlayoffBracket(){
     const round=document.createElement('div');round.className='bracket-round';const heading=document.createElement('h3');
     if(matches.length===1)round.classList.add('bracket-final');
     heading.textContent=matches.length===1?'Championship':(roundIndex===0&&entrants.length<size?'First Round':matches.length===2?'Semifinals':matches.length===4?'Quarterfinals':`Round ${roundIndex+1}`);round.append(heading);
-    matches.forEach(match=>{const card=document.createElement('div');card.className='bracket-match';[match.left,match.right].forEach(label=>{const side=document.createElement('div');side.className='bracket-side'+(label==='BYE'||label.startsWith('Winner of')?' muted':'');side.textContent=label;if(bracketFullNames.has(label))side.title=bracketFullNames.get(label);card.append(side);});round.append(card);});
+    matches.forEach(match=>{const card=document.createElement('div');card.className='bracket-match';[match.left,match.right].forEach(label=>{const side=document.createElement('div');side.className='bracket-side'+(label==='BYE'||label.startsWith('Winner of')?' muted':'');side.textContent=label;card.append(side);});round.append(card);});
     bracket.append(round);nodes=next;roundIndex++;
   }
   playoffBracket.append(bracket);
@@ -1280,43 +1179,37 @@ function bindSubtabs(buttonSelector,viewSelector,prefix,key){document.querySelec
 bindSubtabs('.league-subtab','#panel-league .league-view','league-view-','leagueView');bindSubtabs('.team-subtab','#panel-team .team-view','team-view-','teamView');bindSubtabs('.luck-subtab','#panel-luck .luck-view','luck-view-','luckView');
 
 const luckData=new Map(D.season.map(r=>[r.team,r]));const luckLine=new Chart(document.getElementById('luckLine'),{type:'line',data:{labels:[],datasets:[{label:'Expected wins',data:[],borderColor:colors[0],borderWidth:3,pointRadius:3},{label:'Actual wins',data:[],borderColor:colors[1],borderWidth:3,pointRadius:3,fill:{target:'-1',above:'rgba(63,185,80,.25)',below:'rgba(248,81,73,.25)'}}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{y:{beginAtZero:true,max:Math.max(1,Number(D.completed_week)||0),title:{display:true,text:'Cumulative wins (maximum possible = completed weeks)'}}}}});
-function showLuck(team){const r=luckData.get(team);const weeks=r?.weeks||[];luckLine.options.plugins.title.text=teamAbbrev(team);luckLine.data.labels=['Start',...weeks.map(w=>'W'+w)];luckLine.data.datasets[0].data=[0,...(r?.cum_xw||[])];luckLine.data.datasets[1].data=[0,...(r?.cum_actual||[])];luckLine.update();document.getElementById('luckNote').textContent=r?`Actual ${r.actual.toFixed(1)} · Expected ${r.xw.toFixed(2)} · Luck ${r.luck>=0?'+':''}${r.luck.toFixed(2)} · Expected win rate ${(100*r.xwin_pct).toFixed(1)}%`:'';}const luckButtons=fillTeamButtons('luckTeams',showLuck);
-new Chart(document.getElementById('luckBars'),{type:'bar',data:{labels:D.season.map(r=>teamAbbrev(r.team)),datasets:[{data:D.season.map(r=>r.luck),backgroundColor:D.season.map(r=>r.luck>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.season[items[0].dataIndex]?.team:''}}},scales:{x:{title:{display:true,text:'Actual wins − expected wins'}}}}});
-const clutchValues=D.clutch_rankings.map(row=>row.rating),clutchMin=Math.min(0,...clutchValues),clutchMax=Math.max(0,...clutchValues);
-new Chart(document.getElementById('clutchChart'),{type:'bar',data:{labels:D.clutch_rankings.map(row=>teamAbbrev(row.team)),datasets:[{label:'Clutch rating',data:clutchValues,backgroundColor:clutchValues.map(value=>value>0?'#3fb950':value<0?'#f85149':'#a7b3c2'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>items.length?D.clutch_rankings[items[0].dataIndex]?.team:''}}},scales:{x:{min:clutchMin<0?clutchMin*1.04:0,max:clutchMax>0?clutchMax*1.04:1,title:{display:true,text:'Clutch rating (higher is better)'}},y:{reverse:true}}}});
-const heat=document.getElementById('heat');const hr=document.createElement('tr');['Team',...Array.from({length:D.completed_week},(_,i)=>'W'+(i+1)),'xW','Actual','Luck'].forEach(x=>{const c=document.createElement('th');c.textContent=x;hr.append(c)});heat.append(hr);D.teams.forEach(team=>{const tr=document.createElement('tr');const name=document.createElement('td');name.textContent=teamAbbrev(team);name.title=team;tr.append(name);(D.heat[team]||[]).forEach(v=>{const td=document.createElement('td');td.textContent=v==null?'—':v.toFixed(2);if(v!=null)td.style.background=`hsl(${120*v},65%,45%)`;tr.append(td)});const r=luckData.get(team)||{xw:0,actual:0,luck:0};[r.xw.toFixed(2),r.actual.toFixed(1),(r.luck>=0?'+':'')+r.luck.toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});heat.append(tr)});
+function showLuck(team){const r=luckData.get(team);const weeks=r?.weeks||[];luckLine.options.plugins.title.text=team;luckLine.data.labels=['Start',...weeks.map(w=>'W'+w)];luckLine.data.datasets[0].data=[0,...(r?.cum_xw||[])];luckLine.data.datasets[1].data=[0,...(r?.cum_actual||[])];luckLine.update();document.getElementById('luckNote').textContent=r?`Actual ${r.actual.toFixed(1)} · Expected ${r.xw.toFixed(2)} · Luck ${r.luck>=0?'+':''}${r.luck.toFixed(2)} · Expected win rate ${(100*r.xwin_pct).toFixed(1)}%`:'';}const luckButtons=fillTeamButtons('luckTeams',showLuck);
+new Chart(document.getElementById('luckBars'),{type:'bar',data:{labels:D.season.map(r=>r.team),datasets:[{data:D.season.map(r=>r.luck),backgroundColor:D.season.map(r=>r.luck>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:'Actual wins − expected wins'}}}}});
+const clutchValues=D.clutch_rankings.map(row=>row.rating),clutchBound=Math.max(1,...clutchValues.map(value=>Math.abs(value)));
+new Chart(document.getElementById('clutchChart'),{type:'bar',data:{labels:D.clutch_rankings.map(row=>row.team),datasets:[{label:'Clutch rating',data:clutchValues,backgroundColor:clutchValues.map(value=>value>0?'#3fb950':value<0?'#f85149':'#a7b3c2'),borderRadius:4}]},options:{maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{min:-clutchBound,max:clutchBound,title:{display:true,text:'Clutch rating (higher is better)'}},y:{reverse:true}}}});
+const heat=document.getElementById('heat');const hr=document.createElement('tr');['Team',...Array.from({length:D.completed_week},(_,i)=>'W'+(i+1)),'xW','Actual','Luck'].forEach(x=>{const c=document.createElement('th');c.textContent=x;hr.append(c)});heat.append(hr);D.teams.forEach(team=>{const tr=document.createElement('tr');const name=document.createElement('td');name.textContent=team;tr.append(name);(D.heat[team]||[]).forEach(v=>{const td=document.createElement('td');td.textContent=v==null?'—':v.toFixed(2);if(v!=null)td.style.background=`hsl(${120*v},65%,45%)`;tr.append(td)});const r=luckData.get(team)||{xw:0,actual:0,luck:0};[r.xw.toFixed(2),r.actual.toFixed(1),(r.luck>=0?'+':'')+r.luck.toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});heat.append(tr)});
 
-let liveGameWindows=[];const gameActivityPlugin={id:'gameActivity',beforeDatasetsDraw(chart){if(chart.canvas.id!=='liveChart'||!liveGameWindows.length)return;const {ctx,chartArea,scales}=chart,xScale=scales.x;if(!chartArea||!xScale)return;const min=Number(xScale.min),max=Number(xScale.max);ctx.save();for(const [start,end] of liveGameWindows){if(!Number.isFinite(start)||!Number.isFinite(end)||end<=min||start>=max)continue;const startX=xScale.getPixelForValue(start),endX=xScale.getPixelForValue(end),left=Math.max(chartArea.left,Math.min(startX,endX)),right=Math.min(chartArea.right,Math.max(startX,endX));ctx.fillStyle='rgba(167,179,194,.14)';ctx.fillRect(left,chartArea.top,Math.max(1,right-left),chartArea.bottom-chartArea.top);ctx.strokeStyle='rgba(190,202,214,.68)';ctx.lineWidth=1.2;ctx.setLineDash([6,5]);for(const time of [start,end]){if(time<min||time>max)continue;const x=xScale.getPixelForValue(time);ctx.beginPath();ctx.moveTo(x,chartArea.top);ctx.lineTo(x,chartArea.bottom);ctx.stroke();}}ctx.setLineDash([]);ctx.restore();}};Chart.register(gameActivityPlugin);
-let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{datasets:[{label:'Home win probability',data:[],borderColor:colors[0],backgroundColor:colors[0],fill:{target:1,above:'rgba(245,166,35,.28)',below:'rgba(77,163,255,.25)'},pointRadius:0,borderWidth:2.5,tension:.18},{label:'50%',data:[],borderColor:'#c9d4de',borderDash:[7,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,animation:false,parsing:false,plugins:{legend:{display:false},title:{display:false},tooltip:{callbacks:{title:items=>items.length?new Date(items[0].parsed.x).toLocaleString():''}}},interaction:{mode:'nearest',axis:'x',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Home team win probability (%)'}},x:{type:'linear',ticks:{maxTicksLimit:10,maxRotation:0,callback:value=>new Date(Number(value)).toLocaleTimeString([],{weekday:'short',hour:'numeric',minute:'2-digit'})},title:{display:false}}}}});
+let liveGameWindows=[];const gameActivityPlugin={id:'gameActivity',beforeDatasetsDraw(chart){if(chart.canvas.id!=='liveChart'||!liveGameWindows.length)return;const {ctx,chartArea,scales}=chart,xScale=scales.x;if(!chartArea||!xScale)return;const min=Number(xScale.min),max=Number(xScale.max);ctx.save();for(const [rawStart,rawEnd] of liveGameWindows){const start=rawStart<1e12?rawStart*1000:rawStart,end=rawEnd<1e12?rawEnd*1000:rawEnd;if(end<=min||start>=max)continue;const x1=xScale.getPixelForValue(start),x2=xScale.getPixelForValue(end),left=Math.max(chartArea.left,Math.min(x1,x2)),right=Math.min(chartArea.right,Math.max(x1,x2));ctx.fillStyle='rgba(167,179,194,.055)';ctx.fillRect(left,chartArea.top,Math.max(1,right-left),chartArea.bottom-chartArea.top);ctx.strokeStyle='rgba(190,202,214,.16)';ctx.lineWidth=1;ctx.setLineDash([6,5]);for(const time of [start,end]){if(time<min||time>max)continue;const x=xScale.getPixelForValue(time);ctx.beginPath();ctx.moveTo(x,chartArea.top);ctx.lineTo(x,chartArea.bottom);ctx.stroke();}}ctx.setLineDash([]);ctx.restore();}};Chart.register(gameActivityPlugin);
+let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{datasets:[{label:'Home win probability',data:[],borderColor:colors[0],backgroundColor:colors[0],fill:{target:{value:50},above:'rgba(245,166,35,.28)',below:'rgba(77,163,255,.25)'},pointRadius:0,borderWidth:2.5,tension:.18},{label:'50%',data:[],borderColor:'#c9d4de',borderDash:[7,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},title:{display:false}},interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Home team win probability (%)'}},x:{type:'linear',ticks:{maxTicksLimit:10,maxRotation:0,callback:value=>new Date(value).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'})}}}}});
 const multiverse=D.fantasy_multiverse||{},multiverseTeamsHost=document.getElementById('multiverseTeams'),multiverseColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(D.teams.length,1))} 78% 58%)`),multiverseBins=Array.from({length:Math.max(1,(multiverse.weeks_used||[]).length+1)},(_,i)=>i),multiverseCounts=multiverse.distributions||{};
 function multiverseProbability(team){const rows=multiverseCounts[team]||[],total=multiverse.simulations||1;return multiverseBins.map(wins=>{const item=rows.find(row=>row.wins===wins);return item?100*item.count/total:0;});}
 const multiverseMarker={id:'multiverseActualMarker',afterDraw(chart){const actual=chart.$actualWins;if(actual===undefined||actual===null)return;const x=chart.scales.x.getPixelForValue(actual);if(!Number.isFinite(x))return;const {ctx,chartArea}=chart;ctx.save();ctx.strokeStyle='#f5a623';ctx.lineWidth=2;ctx.setLineDash([7,5]);ctx.beginPath();ctx.moveTo(x,chartArea.top);ctx.lineTo(x,chartArea.bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#f5a623';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('Actual: '+actual,x,chartArea.top+14);ctx.restore();}};Chart.register(multiverseMarker);
 let selectedMultiverseTeam=D.teams[0]||'',pinnedMultiverseIndex=null;
 const multiverseTeamChart=new Chart(document.getElementById('multiverseTeamChart'),{type:'bar',data:{labels:multiverseBins.map(String),datasets:[{label:'Probability',data:[],backgroundColor:'rgba(77,163,255,.65)',borderColor:'#4da3ff',borderWidth:1}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:item=>item.raw.toFixed(2)+'% of simulated schedules'}}},scales:{x:{title:{display:true,text:'Wins'}},y:{beginAtZero:true,title:{display:true,text:'Schedule probability (%)'}}}}});
-function showMultiverseTeam(team){selectedMultiverseTeam=team;const index=D.teams.indexOf(team),probabilities=multiverseProbability(team);multiverseTeamChart.data.datasets[0].data=probabilities;multiverseTeamChart.data.datasets[0].backgroundColor=`${multiverseColors[index]}`;multiverseTeamChart.data.datasets[0].borderColor=multiverseColors[index];multiverseTeamChart.$actualWins=multiverse.actual_wins?.[team]??null;multiverseTeamChart.options.plugins.title={display:true,text:teamAbbrev(team)+' · wins under simulated schedules'};multiverseTeamChart.update();document.getElementById('multiverseTeamLabel').textContent=`Real schedule: ${multiverse.actual_wins?.[team]??0} wins · ${multiverse.simulations||0} schedules`;
+function showMultiverseTeam(team){selectedMultiverseTeam=team;const index=D.teams.indexOf(team),probabilities=multiverseProbability(team);multiverseTeamChart.data.datasets[0].data=probabilities;multiverseTeamChart.data.datasets[0].backgroundColor=`${multiverseColors[index]}`;multiverseTeamChart.data.datasets[0].borderColor=multiverseColors[index];multiverseTeamChart.$actualWins=multiverse.actual_wins?.[team]??null;multiverseTeamChart.options.plugins.title={display:true,text:team+' · wins under simulated schedules'};multiverseTeamChart.update();document.getElementById('multiverseTeamLabel').textContent=`Real schedule: ${multiverse.actual_wins?.[team]??0} wins · ${multiverse.simulations||0} schedules`;
  [...multiverseTeamsHost.children].forEach(button=>{const active=button.title===team;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});}
 function highlightMultiverseLine(index){const team=index===null?null:D.teams[index];multiverseAllChart.data.datasets.forEach((dataset,i)=>{dataset.borderColor=index===null?multiverseColors[i]:(i===index?multiverseColors[i]:'rgba(160,170,180,.18)');dataset.backgroundColor=dataset.borderColor;dataset.borderWidth=i===index?4:1.5;dataset.pointRadius=i===index?3:0;});multiverseAllChart.$actualWins=team?multiverse.actual_wins?.[team]:null;const label=document.getElementById('multiverseAllLabel');label.textContent=team?`${team} · ${multiverse.actual_wins?.[team]??0} wins on the real schedule`:'Hover over or click a line to highlight a team.';label.style.color=index===null?'var(--muted)':multiverseColors[index];multiverseAllChart.update('none');}
-const multiverseAllChart=new Chart(document.getElementById('multiverseAllChart'),{type:'line',data:{labels:multiverseBins.map(String),datasets:D.teams.map((team,index)=>({label:teamAbbrev(team),data:multiverseProbability(team),borderColor:multiverseColors[index],backgroundColor:multiverseColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18}))},options:{maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:item=>`${D.teams[item.datasetIndex]}: ${item.raw.toFixed(2)}%`}}},scales:{x:{title:{display:true,text:'Wins'}},y:{beginAtZero:true,title:{display:true,text:'Schedule probability (%)'}}},onHover:(event,elements)=>{if(pinnedMultiverseIndex===null)highlightMultiverseLine(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedMultiverseIndex=null;highlightMultiverseLine(null);}else{pinnedMultiverseIndex=pinnedMultiverseIndex===index?null:index;highlightMultiverseLine(pinnedMultiverseIndex);if(pinnedMultiverseIndex!==null)showMultiverseTeam(D.teams[pinnedMultiverseIndex]);}}}});
+const multiverseAllChart=new Chart(document.getElementById('multiverseAllChart'),{type:'line',data:{labels:multiverseBins.map(String),datasets:D.teams.map((team,index)=>({label:team,data:multiverseProbability(team),borderColor:multiverseColors[index],backgroundColor:multiverseColors[index],borderWidth:1.5,pointRadius:1,pointHoverRadius:5,tension:.18}))},options:{maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:item=>`${D.teams[item.datasetIndex]}: ${item.raw.toFixed(2)}%`}}},scales:{x:{title:{display:true,text:'Wins'}},y:{beginAtZero:true,title:{display:true,text:'Schedule probability (%)'}}},onHover:(event,elements)=>{if(pinnedMultiverseIndex===null)highlightMultiverseLine(elements[0]?.datasetIndex??null);},onClick:(event,elements)=>{const index=elements[0]?.datasetIndex;if(index===undefined){pinnedMultiverseIndex=null;highlightMultiverseLine(null);}else{pinnedMultiverseIndex=pinnedMultiverseIndex===index?null:index;highlightMultiverseLine(pinnedMultiverseIndex);if(pinnedMultiverseIndex!==null)showMultiverseTeam(D.teams[pinnedMultiverseIndex]);}}}});
 D.teams.forEach(team=>makeChoiceButton(multiverseTeamsHost,teamAbbrev(team),team,false,()=>{showMultiverseTeam(team);highlightMultiverseLine(D.teams.indexOf(team));}));
 showMultiverseTeam(selectedMultiverseTeam);
-function makePieChart(id,counts,title){const entries=D.teams.map(team=>[team,Number(counts[team]||0)]).filter(([,value])=>value>0);return new Chart(document.getElementById(id),{type:'pie',data:{labels:entries.map(([team])=>teamAbbrev(team)),datasets:[{data:entries.map(([,value])=>value),backgroundColor:entries.map(([team])=>multiverseColors[D.teams.indexOf(team)]),borderColor:'#161d26',borderWidth:2}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:title},legend:{position:'bottom'},tooltip:{callbacks:{label:item=>{const total=item.dataset.data.reduce((sum,value)=>sum+value,0);return `${entries[item.dataIndex][0]}: ${item.raw.toLocaleString()} (${(100*item.raw/(total||1)).toFixed(1)}%)`;}}}}}});}
-makePieChart('multiverseFirstPie',multiverse.first_place_counts||{},'First-place finishes');
-const multiverseSummary=document.getElementById('multiverseSummaryTable'),multiverseSimulations=Number(multiverse.simulations)||0;
-const multiverseSummaryRows=D.teams.map(team=>{const actual=Number(multiverse.actual_wins?.[team]||0),distribution=multiverseCounts[team]||[],counts=distribution.reduce((sum,row)=>sum+Number(row.count||0),0),average=distribution.reduce((sum,row)=>sum+Number(row.wins||0)*Number(row.count||0),0)/(counts||1),atOrBelow=distribution.filter(row=>Number(row.wins)<=actual).reduce((sum,row)=>sum+Number(row.count||0),0),percentile=counts?100*atOrBelow/counts:0;return{team,actual,average,percentile};});
-let multiverseSort='percentile',multiverseDirection=-1;
-function renderMultiverseSummary(){multiverseSummary.replaceChildren();const header=document.createElement('tr');[['Team','team'],['Actual wins','actual'],['Average simulated wins','average'],['Actual wins percentile','percentile']].forEach(([label,key])=>{const th=document.createElement('th');th.textContent=label+(key===multiverseSort?(multiverseDirection<0?' ▼':' ▲'):'');th.className='sortable';th.setAttribute('aria-sort',key===multiverseSort?(multiverseDirection<0?'descending':'ascending'):'none');th.addEventListener('click',()=>{if(multiverseSort===key)multiverseDirection*=-1;else{multiverseSort=key;multiverseDirection=key==='team'?1:-1;}renderMultiverseSummary();});header.append(th);});multiverseSummary.append(header);const rows=[...multiverseSummaryRows].sort((a,b)=>multiverseSort==='team'?multiverseDirection*a.team.localeCompare(b.team):multiverseDirection*(a[multiverseSort]-b[multiverseSort]));const percentileValues=multiverseSummaryRows.map(row=>row.percentile);rows.forEach(row=>{const tr=document.createElement('tr'),teamCell=document.createElement('td');teamCell.textContent=teamAbbrev(row.team);teamCell.title=row.team;tr.append(teamCell);[row.actual.toFixed(0),row.average.toFixed(2)].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});const percentile=document.createElement('td');percentile.textContent=row.percentile.toFixed(1)+'%';percentile.className='standings-value';percentile.style.color=colorByLeagueAverage(row.percentile,percentileValues);tr.append(percentile);multiverseSummary.append(tr);});}
-renderMultiverseSummary();
-const playoffPieCanvas=document.getElementById('multiversePlayoffPie'),multiversePlayoffNote=document.getElementById('multiversePlayoffNote');
-if(multiverse.playoff?.finals_complete){multiversePlayoffNote.textContent='Based on completed playoff scoring weeks; semifinal and final matchup frequencies are retained in the generated dashboard data.';makePieChart('multiversePlayoffPie',multiverse.playoff.champions,'Potential playoff titles');}else{playoffPieCanvas.style.display='none';multiversePlayoffNote.textContent='Playoff semifinal, final, and champion schedule outcomes will be calculated as postseason scores become available.';}
+const pieAcronyms={id:'pieAcronyms',afterDatasetsDraw(chart){if(chart.canvas.id!=='multiverseFirstPie'||!chart.chartArea)return;const arcs=chart.getDatasetMeta(0).data,ctx=chart.ctx;ctx.save();ctx.font='16px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#f4f7fa';arcs.forEach((arc,index)=>{const acronym=chart.$acronyms?.[index]||'',angle=arc.endAngle-arc.startAngle;if(!acronym||angle<=0)return;const radius=arc.outerRadius*.64,chord=2*radius*Math.sin(angle/2),needed=ctx.measureText(acronym).width+10;if(chord<needed)return;const mid=(arc.startAngle+arc.endAngle)/2,x=arc.x+Math.cos(mid)*radius,y=arc.y+Math.sin(mid)*radius;ctx.fillText(acronym,x,y);});ctx.restore();}};Chart.register(pieAcronyms);
+function makePieChart(id,counts,title){const entries=D.teams.map(team=>[team,Number(counts[team]||0)]).filter(([,value])=>value>0);const chart=new Chart(document.getElementById(id),{type:'pie',data:{labels:entries.map(([team])=>teamAbbrev(team)),datasets:[{data:entries.map(([,value])=>value),backgroundColor:entries.map(([team])=>multiverseColors[D.teams.indexOf(team)]),borderColor:'#161d26',borderWidth:2}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:title,font:{size:16}},legend:{position:'bottom'},tooltip:{callbacks:{label:item=>{const total=item.dataset.data.reduce((sum,value)=>sum+value,0),team=entries[item.dataIndex]?.[0]||item.label;return `${team}: ${item.raw.toLocaleString()} (${(100*item.raw/(total||1)).toFixed(1)}%)`;}}}}}});chart.$acronyms=entries.map(([team])=>teamAbbrev(team));return chart;}
+makePieChart('multiverseFirstPie',multiverse.first_place_counts||{},multiverse.first_place_label||'First-place finishes');
 
 const liveWeeksHost=document.getElementById('liveWeeks'),liveMatchupsHost=document.getElementById('liveMatchups'),liveNote=document.getElementById('liveNote'),liveCache={};let selectedLiveWeek='',selectedLiveMatchup=0;function makeChoiceButton(host,label,title,active,onClick){const b=document.createElement('button');b.type='button';b.className='team-button'+(active?' active':'');b.textContent=label;b.title=title;b.setAttribute('aria-label',title);b.setAttribute('aria-pressed',String(active));b.addEventListener('click',onClick);host.append(b);return b;}function fillLiveWeeks(){const keys=(D.live_weeks||[]).map(Number).filter(Number.isFinite).sort((a,b)=>b-a);if(!keys.length){makeChoiceButton(liveWeeksHost,'—','No snapshots recorded',false,()=>{});liveNote.textContent='No snapshots recorded';return;}selectedLiveWeek=String(keys[0]);keys.forEach(w=>makeChoiceButton(liveWeeksHost,'W'+w,'Week '+w+(w===D.current_week?' (current)':''),String(w)===selectedLiveWeek,()=>{selectedLiveWeek=String(w);[...liveWeeksHost.children].forEach((b,i)=>{const active=keys[i]===w;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));});selectedLiveMatchup=0;loadLive();}));}
-function showLive(){const snap=liveCache[selectedLiveWeek];if(!snap||!snap.matchups){liveNote.textContent='No recorded snapshots for this week.';return;}liveMatchupsHost.replaceChildren();const order=snap.matchups.map((_,i)=>i).sort((a,b)=>{const rank=i=>snap.matchups[i].some(n=>n.toLowerCase()==='league manager')?0:1;return rank(a)-rank(b)||a-b;});order.forEach(i=>{const m=snap.matchups[i],label=teamAbbrev(m[0])+' vs '+teamAbbrev(m[1]);makeChoiceButton(liveMatchupsHost,label,m[0]+' vs '+m[1],i===selectedLiveMatchup,()=>{selectedLiveMatchup=i;showLive();});});if(selectedLiveMatchup>=snap.matchups.length)selectedLiveMatchup=0;const i=selectedLiveMatchup;const rows=(snap.snaps||[]).filter(s=>s[1]?.[i]).sort((a,b)=>a[0]-b[0]);const home=snap.matchups[i]?.[0]||'Home',away=snap.matchups[i]?.[1]||'Away';document.getElementById('liveTopTeam').textContent=teamAbbrev(home);document.getElementById('liveBottomTeam').textContent=teamAbbrev(away);document.getElementById('liveTopTeam').title=home;document.getElementById('liveBottomTeam').title=away;liveGameWindows=(snap.game_windows?.[i]||[]).map(window=>[Number(window[0])*1000,Number(window[1])*1000]);liveChart.data.datasets[0].label=home+' win probability';liveChart.data.datasets[0].data=rows.map(s=>({x:Number(s[0])*1000,y:Number(s[1][i][2])}));liveChart.data.datasets[1].data=rows.map(s=>({x:Number(s[0])*1000,y:50}));const times=[...rows.map(s=>Number(s[0])*1000),...liveGameWindows.flat()],firstTime=times.length?Math.min(...times):Date.now(),lastTime=times.length?Math.max(...times):firstTime+60000,pad=lastTime===firstTime?60000:0;liveChart.options.scales.x.min=firstTime-pad;liveChart.options.scales.x.max=lastTime+pad;liveChart.update();liveNote.textContent=rows.length?`${rows.length} snapshots · latest ${new Date(rows.at(-1)[0]*1000).toLocaleString()}`:'Waiting for game snapshots.';}
+function showLive(){const snap=liveCache[selectedLiveWeek];if(!snap||!snap.matchups){liveNote.textContent='No recorded snapshots for this week.';return;}liveMatchupsHost.replaceChildren();const order=snap.matchups.map((_,i)=>i).sort((a,b)=>{const rank=i=>snap.matchups[i].some(n=>n.toLowerCase()==='league manager')?0:1;return rank(a)-rank(b)||a-b;});order.forEach(i=>{const m=snap.matchups[i],label=teamAbbrev(m[0])+' vs '+teamAbbrev(m[1]);makeChoiceButton(liveMatchupsHost,label,m[0]+' vs '+m[1],i===selectedLiveMatchup,()=>{selectedLiveMatchup=i;showLive();});});if(selectedLiveMatchup>=snap.matchups.length)selectedLiveMatchup=0;const i=selectedLiveMatchup;const rows=(snap.snaps||[]).filter(s=>s[1]?.[i]).sort((a,b)=>a[0]-b[0]);const home=snap.matchups[i]?.[0]||'Home',away=snap.matchups[i]?.[1]||'Away';document.getElementById('liveTopTeam').textContent=teamAbbrev(home);document.getElementById('liveTopTeam').title=home;document.getElementById('liveBottomTeam').textContent=teamAbbrev(away);document.getElementById('liveBottomTeam').title=away;liveGameWindows=(snap.game_windows?.[i]||[]).map(window=>[Number(window[0]),Number(window[1])]);const points=rows.map(row=>({x:Number(row[0])*1000,y:Number(row[1][i][2])}));liveChart.data.datasets[0].label=home+' win probability';liveChart.data.datasets[0].data=points;liveChart.data.datasets[1].data=points.map(point=>({x:point.x,y:50}));const times=[...points.map(point=>point.x),...liveGameWindows.flatMap(window=>window.map(value=>value<1e12?value*1000:value))];if(times.length){liveChart.options.scales.x.min=Math.min(...times);liveChart.options.scales.x.max=Math.max(...times);}liveChart.update();liveNote.textContent=rows.length?`${rows.length} snapshots · latest ${new Date(rows.at(-1)[0]*1000).toLocaleString()}`:'Waiting for game snapshots.';}
 async function loadLive(){const week=selectedLiveWeek;if(!week||!/^\d+$/.test(week)){showLive();return;}try{const res=await fetch(`live_week_${week}.json?t=${Date.now()}`,{cache:'no-store'});if(res.ok)liveCache[week]=await res.json();}catch(_){}showLive();}
 fillLiveWeeks();loadLive();
 
 const ratingByTeam=new Map(D.trade_ratings.map(r=>[r.team_id,r]));const teamIdByName=new Map(D.teams.map(n=>[n,D.roster_team_ids[n]]));
 function ratingClass(label){return label==='GM of the Year'?'gm':label==='Fleeced'?'fleeced':'inmix';}
-const teamTradeChart=new Chart(document.getElementById('teamTradeChart'),{type:'line',data:{labels:[],datasets:[{label:'Cumulative received - sent',data:[],borderColor:colors[0],fill:{target:{value:0},above:'rgba(63,185,80,.28)',below:'rgba(248,81,73,.28)'},borderWidth:2.5,pointRadius:3,tension:.2},{label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom',labels:{filter:item=>item.text!=='0 points'}}},interaction:{mode:'index',intersect:false},scales:{y:{min:-1,max:1,title:{display:true,text:'Cumulative fantasy points'},ticks:{precision:1}},x:{title:{display:true,text:'Week'}}}}});
+const teamTradeChart=new Chart(document.getElementById('teamTradeChart'),{type:'line',data:{labels:[],datasets:[{label:'Cumulative received - sent',data:[],borderColor:colors[0],fill:{target:{value:0},above:'rgba(63,185,80,.28)',below:'rgba(248,81,73,.28)'},borderWidth:2.5,pointRadius:3,tension:.2},{label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},interaction:{mode:'index',intersect:false},scales:{y:{min:-1,max:1,title:{display:true,text:'Cumulative fantasy points'},ticks:{precision:1}},x:{title:{display:true,text:'Week'}}}}});
 const individualTradeCharts=new Set();
 function renderTrades(selected){
   const tid=teamIdByName.get(selected),rating=ratingByTeam.get(String(tid));
@@ -1327,16 +1220,16 @@ function renderTrades(selected){
   const list=D.trades.filter(t=>t.sides.some(s=>s.team===selected));
   const weekCount=Math.max(0,Number(D.completed_week)||0),weeklyNet=new Map(Array.from({length:weekCount},(_,i)=>[i+1,0]));
   list.forEach(t=>{const side=t.sides.find(s=>s.team===selected);(side.weekly_points||[]).forEach(row=>weeklyNet.set(Number(row.week),(weeklyNet.get(Number(row.week))||0)+Number(row.net||0)));});const weeklyTotals=[...weeklyNet.values()];let runningNet=0;const cumulativeNet=weeklyTotals.map(points=>runningNet+=points);
-  document.getElementById('teamTradeTitle').textContent=`${teamAbbrev(selected)} · cumulative received players minus sent players by week`;
+  document.getElementById('teamTradeTitle').textContent=`${selected} - cumulative received players minus sent players by week`;
   teamTradeChart.data.labels=[...weeklyNet.keys()].map(w=>'W'+w);
-  const yMin=Math.min(0,...cumulativeNet),yMax=Math.max(0,...cumulativeNet);teamTradeChart.options.scales.y.min=yMin<0?yMin*1.04:0;teamTradeChart.options.scales.y.max=yMax>0?yMax*1.04:1;
+  const yMin=Math.min(0,...cumulativeNet),yMax=Math.max(0,...cumulativeNet);teamTradeChart.options.scales.y.min=yMin===yMax?-1:yMin;teamTradeChart.options.scales.y.max=yMin===yMax?1:yMax;
   teamTradeChart.data.datasets[0].data=cumulativeNet;teamTradeChart.data.datasets[1].data=cumulativeNet.map(()=>0);teamTradeChart.update();
   if(!list.length){const p=document.createElement('p');p.className='muted';p.textContent='No accepted trade records are available for this team.';area.append(p);return;}
   list.sort((a,b)=>b.week-a.week).forEach(t=>{
     const side=t.sides.find(s=>s.team===selected),card=document.createElement('div');card.className='trade-card';
     const layout=document.createElement('div');layout.className='trade-card-layout';
     const info=document.createElement('div');info.className='trade-card-info';
-    const h=document.createElement('h3'),title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>teamAbbrev(s.team)).join(' ↔ ')}`;title.title=t.sides.map(s=>s.team).join(' ↔ ');
+    const h=document.createElement('h3'),title=document.createElement('span');title.textContent=`Week ${t.week} · ${t.date} · ${t.sides.map(s=>s.team).join(' ↔ ')}`;
     const tradeBadge=document.createElement('span');tradeBadge.className='badge trade-rating '+ratingClass(side.rating);tradeBadge.textContent=side.rating;h.append(title,tradeBadge);
     const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;
     const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;
@@ -1350,7 +1243,7 @@ function renderTrades(selected){
     }else{chartBox.className+=' muted';chartBox.textContent='No post-trade scoring weeks yet.';chartBox.style.display='grid';chartBox.style.placeItems='center';chartBox.style.fontSize='12px';}
     layout.append(chartBox);card.append(layout);area.append(card);
   });
-}const visibleTradeWarning=(D.trade_warning||'').replace(/Some malformed ESPN transaction rows were skipped for week\(s\)[^;]*; valid trades from those weeks were still included\.?/gi,'').trim();document.getElementById('tradeNotice').textContent=visibleTradeWarning;document.getElementById('tradeNotice').style.display=visibleTradeWarning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
+}document.getElementById('tradeNotice').textContent=D.trade_warning;document.getElementById('tradeNotice').style.display=D.trade_warning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
 // Snapshot refresh: the workflow publishes at five-minute intervals.
 setInterval(()=>{if(String(selectedLiveWeek)===String(D.current_week))loadLive();},60000);
 </script></body></html>'''.replace("__DATA__", data)
