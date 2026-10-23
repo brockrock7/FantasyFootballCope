@@ -53,7 +53,7 @@ def _probability(home_score, away_score, home_lineup, away_lineup):
 
 
 def _game_in_progress(*lineups):
-    """Report whether ESPN marks any active starter as currently playing."""
+    """Best-effort fallback status for older dashboard clients."""
     for lineup in lineups:
         for player in lineup or []:
             if getattr(player, "slot_position", "") in ("BE", "IR"):
@@ -67,6 +67,24 @@ def _game_in_progress(*lineups):
     return False
 
 
+def _game_windows(*lineups):
+    """Return scheduled kickoff and three-hour end timestamps for active players."""
+    windows = set()
+    for lineup in lineups:
+        for player in lineup or []:
+            if getattr(player, "slot_position", "") in ("BE", "IR"):
+                continue
+            game_date = getattr(player, "game_date", None)
+            if game_date is None:
+                continue
+            try:
+                start = int(game_date.timestamp())
+            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+                continue
+            windows.add((start, start + 3 * 60 * 60))
+    return [list(window) for window in sorted(windows)]
+
+
 def main():
     league = League(
         league_id=LEAGUE_ID,
@@ -76,7 +94,7 @@ def main():
     )
     week = int(league.current_week)
     path = ROOT / f"live_week_{week}.json"
-    matchups, values = [], []
+    matchups, values, game_windows = [], [], []
     for box in league.box_scores(week):
         home = getattr(getattr(box, "home_team", None), "team_name", None)
         away = getattr(getattr(box, "away_team", None), "team_name", None)
@@ -85,6 +103,7 @@ def main():
         matchups.append([home, away])
         home_lineup = getattr(box, "home_lineup", [])
         away_lineup = getattr(box, "away_lineup", [])
+        game_windows.append(_game_windows(home_lineup, away_lineup))
         values.append([
             round(float(box.home_score or 0), 2),
             round(float(box.away_score or 0), 2),
@@ -96,7 +115,7 @@ def main():
         ])
 
     now = int(time.time())
-    snapshot = {"week": week, "matchups": matchups, "snaps": []}
+    snapshot = {"week": week, "matchups": matchups, "snaps": [], "game_windows": game_windows}
     if path.exists():
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
@@ -107,7 +126,7 @@ def main():
     snaps = snapshot.get("snaps", [])
     if not snaps or now - int(snaps[-1][0]) >= 60:
         snaps.append([now, values])
-    snapshot.update({"week": week, "matchups": matchups, "snaps": snaps[-3000:]})
+    snapshot.update({"week": week, "matchups": matchups, "snaps": snaps[-3000:], "game_windows": game_windows})
     path.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
     print(f"Saved {len(snapshot['snaps'])} snapshots for week {week}")
 
