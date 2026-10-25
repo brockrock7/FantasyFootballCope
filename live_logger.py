@@ -110,12 +110,62 @@ def _game_windows(*lineups, pro_schedule=None):
         end = kickoff + timedelta(hours=3)
         windows.add((int(kickoff.timestamp()), int(end.timestamp())))
 
-    # Sunday afternoon and night games use one shared 1 p.m. to 11 p.m. block.
+    # Sunday afternoon and night games use one shared 1 p.m. to midnight block.
     for game_date in sunday_dates:
         start = datetime.combine(game_date, datetime_time(13, 0), tzinfo=eastern)
-        end = datetime.combine(game_date, datetime_time(23, 0), tzinfo=eastern)
+        end = datetime.combine(game_date + timedelta(days=1), datetime_time(0, 0), tzinfo=eastern)
         windows.add((int(start.timestamp()), int(end.timestamp())))
     return [list(window) for window in sorted(windows)]
+
+
+def _sampling_bucket(timestamp=None):
+    """Return the scheduled sample slot using the user's Eastern time blocks."""
+    eastern = ZoneInfo("America/Toronto")
+    now = datetime.fromtimestamp(timestamp or time.time(), eastern)
+    # Fantasy sampling weeks roll over at Tuesday midnight.
+    tuesday = now.date() - timedelta(days=(now.weekday() - 1) % 7)
+    thursday = tuesday + timedelta(days=2)
+    friday = tuesday + timedelta(days=3)
+    sunday = tuesday + timedelta(days=5)
+    monday = tuesday + timedelta(days=6)
+
+    def at(day, hour):
+        return datetime.combine(day, datetime_time(hour, 0), tzinfo=eastern)
+
+    if now < at(thursday, 20):
+        anchor, interval = at(tuesday, 0), 6 * 60 * 60
+    elif now < at(friday, 0):
+        anchor, interval = at(thursday, 20), 10 * 60
+    elif now < at(sunday, 13):
+        anchor, interval = at(friday, 0), 6 * 60 * 60
+    elif now < at(monday, 0):
+        anchor, interval = at(sunday, 13), 10 * 60
+    elif now < at(monday, 20):
+        anchor, interval = at(monday, 0), 6 * 60 * 60
+    else:
+        anchor, interval = at(monday, 20), 10 * 60
+
+    anchor_epoch = int(anchor.timestamp())
+    bucket = anchor_epoch + ((int(now.timestamp()) - anchor_epoch) // interval) * interval
+    return bucket, interval
+
+
+def _sampling_windows(timestamp=None):
+    """Return the three higher-frequency blocks displayed behind the graph."""
+    eastern = ZoneInfo("America/Toronto")
+    now = datetime.fromtimestamp(timestamp or time.time(), eastern)
+    tuesday = now.date() - timedelta(days=(now.weekday() - 1) % 7)
+    thursday, friday = tuesday + timedelta(days=2), tuesday + timedelta(days=3)
+    sunday, monday = tuesday + timedelta(days=5), tuesday + timedelta(days=6)
+
+    def epoch(day, hour):
+        return int(datetime.combine(day, datetime_time(hour, 0), tzinfo=eastern).timestamp())
+
+    return [
+        [epoch(thursday, 20), epoch(friday, 0)],
+        [epoch(sunday, 13), epoch(monday, 0)],
+        [epoch(monday, 20), epoch(tuesday + timedelta(days=7), 0)],
+    ]
 
 
 def main():
@@ -148,6 +198,7 @@ def main():
         ])
 
     now = int(time.time())
+    sample_bucket, sample_interval = _sampling_bucket(now)
     try:
         pro_schedule = league._get_pro_schedule(week)
     except Exception as exc:
@@ -155,7 +206,9 @@ def main():
         pro_schedule = {}
     league_game_windows = _game_windows(*all_lineups, pro_schedule=pro_schedule)
     game_windows = [league_game_windows for _ in matchups]
-    snapshot = {"week": week, "matchups": matchups, "snaps": [], "game_windows": game_windows}
+    sampling_windows = _sampling_windows(now)
+    snapshot = {"week": week, "matchups": matchups, "snaps": [], "game_windows": game_windows,
+                "sampling_windows": sampling_windows}
     if path.exists():
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
@@ -164,11 +217,13 @@ def main():
         except (OSError, ValueError, AttributeError):
             pass
     snaps = snapshot.get("snaps", [])
-    if not snaps or now - int(snaps[-1][0]) >= 60:
+    append_snapshot = not snaps or _sampling_bucket(int(snaps[-1][0]))[0] != sample_bucket
+    if append_snapshot:
         snaps.append([now, values])
-    snapshot.update({"week": week, "matchups": matchups, "snaps": snaps[-3000:], "game_windows": game_windows})
+    snapshot.update({"week": week, "matchups": matchups, "snaps": snaps[-3000:],
+                     "game_windows": game_windows, "sampling_windows": sampling_windows})
     path.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
-    print(f"Saved {len(snapshot['snaps'])} snapshots for week {week}")
+    print(f"{'Saved' if append_snapshot else 'No new sample'}; {len(snapshot['snaps'])} snapshots for week {week} (interval {sample_interval // 60} min)")
 
 
 if __name__ == "__main__":
