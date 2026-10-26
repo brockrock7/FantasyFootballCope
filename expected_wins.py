@@ -634,22 +634,99 @@ def _activity_trade_rows(league, date_weeks):
     return list(trades.values()), unmatched_dates
 
 
-def _current_rosters(league):
+def _current_rosters(league, completed_week):
+    slot_names = {
+        "0": "QB", "2": "RB", "4": "WR", "6": "TE", "16": "D/ST",
+        "17": "K", "20": "BE", "21": "IR", "23": "FLEX", "24": "OP",
+        "25": "DE", "26": "DT", "27": "LB", "28": "CB", "29": "S",
+        "30": "DB", "31": "DP", "32": "DL",
+    }
+    slot_order = {name: index for index, name in enumerate((
+        "QB", "RB", "WR", "TE", "FLEX", "OP", "K", "D/ST", "BE", "IR",
+        "DE", "DT", "LB", "CB", "S", "DB", "DP", "DL",
+    ))}
+
+    def slot_label(player):
+        raw = getattr(player, "lineupSlot", None)
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(player, "slot_position", None)
+        if raw is None or str(raw).strip() == "":
+            raw = "BE"
+        label = str(raw).strip().upper()
+        return slot_names.get(label, label)
+
+    def bye_week(player):
+        explicit = getattr(player, "bye_week", None) or getattr(player, "byeWeek", None)
+        try:
+            if explicit:
+                return int(explicit)
+        except (TypeError, ValueError):
+            pass
+        schedule = getattr(player, "schedule", None) or {}
+        if isinstance(schedule, dict):
+            played_weeks = set()
+            for key, game in schedule.items():
+                try:
+                    week = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if game:
+                    played_weeks.add(week)
+        elif isinstance(schedule, (list, tuple)):
+            played_weeks = {index + 1 for index, game in enumerate(schedule) if game}
+        else:
+            played_weeks = set()
+        return next((week for week in range(1, 19) if week not in played_weeks), None) if played_weeks else None
+
     result = {}
     for team in league.teams:
-        result[str(team.team_id)] = [
-            {
-                "id": int(player.playerId),
-                "name": str(player.name),
-                "position": str(player.position),
+        players = []
+        for player in getattr(team, "roster", []) or []:
+            player_id = int(getattr(player, "playerId", 0) or 0)
+            stats = getattr(player, "stats", {}) or {}
+            actual_total = projection_delta = 0.0
+            played_games = projection_weeks = 0
+            for week in range(1, max(0, int(completed_week)) + 1):
+                weekly = stats.get(week, stats.get(str(week), {})) if isinstance(stats, dict) else {}
+                if not isinstance(weekly, dict):
+                    continue
+                actual = weekly.get("points")
+                projected = weekly.get("projected_points", weekly.get("projectedPoints"))
+                if actual is not None:
+                    actual = _safe_float(actual)
+                    actual_total += actual
+                    if actual > 0:
+                        played_games += 1
+                    if projected is not None:
+                        projection_delta += actual - _safe_float(projected)
+                        projection_weeks += 1
+            avg_points = _safe_float(getattr(player, "avg_points", 0))
+            ppg = avg_points if avg_points > 0 else (actual_total / played_games if played_games else 0.0)
+            pos_rank = getattr(player, "posRank", None) or getattr(player, "position_rank", None)
+            try:
+                pos_rank = int(pos_rank) if pos_rank is not None else None
+            except (TypeError, ValueError):
+                pos_rank = None
+            nfl_team = getattr(player, "proTeam", None) or getattr(player, "pro_team", None) or "—"
+            players.append({
+                "id": player_id,
+                "name": str(getattr(player, "name", "Unknown player")),
+                "position": str(getattr(player, "position", "—")),
+                "slot": slot_label(player),
+                "ppg": round(ppg, 2),
+                "projection_delta": round(projection_delta, 2) if projection_weeks else None,
+                "pos_rank": pos_rank,
+                "bye_week": bye_week(player),
+                "nfl_team": str(nfl_team),
+                "photo_url": f"https://a.espncdn.com/i/headshots/nfl/players/full/{player_id}.png" if player_id > 0 else "",
                 "projected_remaining": round(max(
                     0.0,
                     _safe_float(getattr(player, "projected_total_points", 0))
                     - _safe_float(getattr(player, "total_points", 0)),
                 ), 1),
-            }
-            for player in getattr(team, "roster", []) or []
-        ]
+            })
+        players.sort(key=lambda item: (slot_order.get(item["slot"], 100), item["name"].casefold()))
+        result[str(team.team_id)] = players
     return result
 
 
@@ -836,7 +913,9 @@ def _trade_data(league, team_names, completed_week):
                     week_points = _safe_float((stats.get(scored_week) or stats.get(str(scored_week)) or {}).get("points"))
                     weekly_points[str(scored_week)] = round(week_points, 2)
                     points_after += week_points
-            moved = {"id": leg["id"], "name": name, "points": round(points_after, 2),
+            moved = {"id": leg["id"], "name": name,
+                     "photo_url": f"https://a.espncdn.com/i/headshots/nfl/players/full/{leg['id']}.png",
+                     "points": round(points_after, 2),
                      "weekly_points": weekly_points}
             by_team[leg["to"]]["incoming"].append(moved)
             by_team[leg["from"]]["outgoing"].append(moved)
@@ -903,7 +982,7 @@ def _build_payload(league):
     current_week = int(league.current_week)
     max_week = min(max(current_week, 1), regular_season_count)
     completed_week = min(max(int(league.current_week) - 1, 0), max_week)
-    current_rosters = _current_rosters(league)
+    current_rosters = _current_rosters(league, completed_week)
 
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
@@ -1362,6 +1441,9 @@ def _html(payload):
 <style>
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
+<style>
+.bracket-scroll.bracket{min-width:0}.trade-card-layout{grid-template-columns:minmax(0,1fr) minmax(390px,1.35fr)}.trade-visuals{display:grid;grid-template-columns:minmax(115px,.45fr) minmax(230px,1fr);gap:12px;align-items:center;min-width:0}.trade-player-flow{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0}.trade-flow-group{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}.trade-flow-label{font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase}.trade-flow-players{display:flex;flex-direction:column;align-items:center;gap:5px;max-height:150px;overflow:auto}.trade-flow-player{display:flex;flex-direction:column;align-items:center;gap:2px;max-width:70px;text-align:center;font-size:9px;line-height:1.15}.trade-flow-player img,.roster-photo{width:38px;height:38px;object-fit:cover;border-radius:50%;background:#263342;border:1px solid var(--line)}.trade-arrow{font-size:22px;color:var(--blue);font-weight:800}.roster-table th,.roster-table td{text-align:left!important;white-space:nowrap}.roster-table .roster-player-name{min-width:150px}.roster-table .roster-slot{font-weight:700;color:var(--blue)}.roster-table tr.roster-bench{opacity:.78}.roster-photo-cell{width:54px}.roster-photo{display:block;width:42px;height:42px}.roster-empty{padding:18px;color:var(--muted)}
+@media(max-width:900px){.trade-card-layout{grid-template-columns:1fr}.trade-visuals{grid-template-columns:minmax(130px,.4fr) minmax(220px,1fr)}}@media(max-width:560px){.trade-visuals{grid-template-columns:1fr}.trade-player-flow{justify-content:flex-start}.trade-flow-players{flex-direction:row;flex-wrap:wrap}.trade-mini-chart{height:210px}}
 </style></head><body><main class="wrap">
 <h1>Fielding of (football) dreams</h1><div class="sub" id="subtitle"></div>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
@@ -1375,7 +1457,7 @@ def _html(payload):
 </section>
 
 <section class="panel" id="panel-team" role="tabpanel">
-<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="starters" aria-selected="false">Starters vs. Bench</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button></div>
+<div class="subtabs" role="tablist" aria-label="Team statistics"><button class="subtab team-subtab active" type="button" data-team-view="position" aria-selected="true">Positional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="acquisition" aria-selected="false">Acquisitional Breakdown</button><button class="subtab team-subtab" type="button" data-team-view="starters" aria-selected="false">Starters vs. Bench</button><button class="subtab team-subtab" type="button" data-team-view="differential" aria-selected="false">Win/Loss Differential</button><button class="subtab team-subtab" type="button" data-team-view="roster" aria-selected="false">Roster Stats</button></div>
 <section class="team-view active" id="team-view-position">
 <article class="card"><h2>6-axis position breakdown</h2><p>Starter points grouped by each player's position. Players in FLEX count toward their own position.</p><div id="radars" class="radar-grid"></div></article>
 <article class="card"><h2>Total points by position · all teams</h2><div class="chartbox"><canvas id="positionTotalsChart"></canvas></div></article>
@@ -1389,6 +1471,8 @@ def _html(payload):
 <article class="card"><h2>Average Win/Loss Differential</h2><p>Average point differential in wins is above zero in green; average point differential in losses is below zero in red.</p><div class="chartbox"><canvas id="overallDifferentialChart"></canvas></div></article>
 </section>
 </section>
+
+<section class="team-view" id="team-view-roster"><article class="card"><h2>Current Roster Stats</h2><div class="toolbar"><span>Team:</span><div id="rosterTeams" class="team-buttons" aria-label="Choose roster team"></div></div><div class="scroll"><table id="rosterStatsTable"></table></div></article></section>
 
 <section class="panel" id="panel-luck" role="tabpanel">
 <div class="subtabs" role="tablist" aria-label="Luck statistics"><button class="subtab luck-subtab active" type="button" data-luck-view="luck" aria-selected="true">Luck</button><button class="subtab luck-subtab" type="button" data-luck-view="quality" aria-selected="false">Win/Loss Quality</button><button class="subtab luck-subtab" type="button" data-luck-view="multiverse" aria-selected="false">Fantasy Multiverse</button></div>
@@ -1433,7 +1517,7 @@ const positionRows=D.teams.flatMap(team=>D.weekly_positions[team]||[]);
 const positionAxisMax=Math.max(20,Math.ceil(Math.max(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.max(0,Number(row[group]||0)),0)))/20)*20);
 const positionAxisMin=Math.min(0,Math.floor(Math.min(0,...positionRows.map(row=>positionGroups.reduce((sum,group)=>sum+Math.min(0,Number(row[group]||0)),0)))/20)*20);
 function setTableCellText(cell,value){const text=String(value??'');const match=text.match(/^(.*?)(\s+\([^()]*\bPPG\))$/);if(!match){cell.textContent=text;return;}const main=document.createElement('span');main.textContent=match[1];const ppg=document.createElement('span');ppg.className='ppg';ppg.textContent=match[2];cell.append(main,ppg);}
-function renderSortableStatsTable(id,columns,rows){const table=document.getElementById(id);let sortKey=columns[0].key,direction=1;function draw(){const ordered=[...rows].sort((a,b)=>{const left=a[sortKey],right=b[sortKey];return (typeof left==='number'&&typeof right==='number'?direction*(left-right):direction*String(left??'').localeCompare(String(right??'')))||String(a.team).localeCompare(String(b.team));});table.replaceChildren();const head=document.createElement('tr');columns.forEach(column=>{const th=document.createElement('th');th.className='sortable';th.textContent=column.label+(column.key===sortKey?(direction<0?' ▼':' ▲'):'');th.title='Sort by '+column.label;th.addEventListener('click',()=>{if(sortKey===column.key)direction*=-1;else{sortKey=column.key;direction=column.key==='team'?1:-1;}draw();});head.append(th);});table.append(head);ordered.forEach(row=>{const tr=document.createElement('tr');columns.forEach(column=>{const td=document.createElement('td');setTableCellText(td,column.render?column.render(row):row[column.key]);if(column.key==='team')td.title=row.team;if(column.cellStyle)column.cellStyle(td,row);tr.append(td);});table.append(tr);});}draw();}
+function renderSortableStatsTable(id,columns,rows,initialSortKey=columns[0].key,initialDirection=1){const table=document.getElementById(id);let sortKey=initialSortKey,direction=initialDirection;function draw(){const ordered=[...rows].sort((a,b)=>{const left=a[sortKey],right=b[sortKey];return (typeof left==='number'&&typeof right==='number'?direction*(left-right):direction*String(left??'').localeCompare(String(right??'')))||String(a.team).localeCompare(String(b.team));});table.replaceChildren();const head=document.createElement('tr');columns.forEach(column=>{const th=document.createElement('th');th.className='sortable';th.textContent=column.label+(column.key===sortKey?(direction<0?' ▼':' ▲'):'');th.title='Sort by '+column.label;th.addEventListener('click',()=>{if(sortKey===column.key)direction*=-1;else{sortKey=column.key;direction=column.key==='team'?1:-1;}draw();});head.append(th);});table.append(head);ordered.forEach(row=>{const tr=document.createElement('tr');columns.forEach(column=>{const td=document.createElement('td');setTableCellText(td,column.render?column.render(row):row[column.key]);if(column.key==='team')td.title=row.team;if(column.cellStyle)column.cellStyle(td,row);tr.append(td);});table.append(tr);});}draw();}
 const positionStatRows=D.teams.map(team=>{const played=(D.weekly_positions[team]||[]).filter(row=>positionGroups.reduce((sum,group)=>sum+Math.abs(Number(row[group]||0)),0)>0).length||1;const row={team};positionGroups.forEach(group=>{row[group]=Number(D.position_totals[team]?.[group]||0);row[group+'_display']=`${row[group].toFixed(1)} (${(row[group]/played).toFixed(1)} PPG)`;});return row;});
 renderSortableStatsTable('positionTotalsTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},...positionGroups.map(group=>({key:group,label:group,render:row=>row[group+'_display']}))],positionStatRows);
 new Chart(document.getElementById('positionTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:positionGroups.map(group=>({label:group,data:D.teams.map(team=>Number(D.position_totals[team]?.[group]||0)),backgroundColor:colors[D.groups.indexOf(group)]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}},},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
@@ -1449,7 +1533,7 @@ function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.opti
 const sourceButtons=fillTeamButtons('sourceTeams',showSource);
 const starterBenchRows=D.teams.map(team=>{const values=D.starter_bench_totals?.[team]||{actual:0,bench:0,optimal:0,left:0,left_ppg:0,actual_ppg:0,optimal_ppg:0,games:0};return{team,...values,optimal_pct:values.optimal>0?100*values.actual/values.optimal:0};});
 const realizationMin=Math.min(...starterBenchRows.map(row=>row.optimal_pct));
-renderSortableStatsTable('starterBenchTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},{key:'actual',label:'Actual points (PPG)',render:row=>`${row.actual.toFixed(1)} (${row.actual_ppg.toFixed(1)} PPG)`},{key:'bench',label:'Bench points',render:row=>row.bench.toFixed(1)},{key:'optimal',label:'Optimal lineup points (PPG)',render:row=>`${row.optimal.toFixed(1)} (${row.optimal_ppg.toFixed(1)} PPG)`},{key:'optimal_pct',label:'Realization of Optimal',render:row=>`${row.optimal_pct.toFixed(1)}%`,cellStyle:(cell,row)=>{const hue=realizationMin>=100?120:120*(row.optimal_pct-realizationMin)/Math.max(1,100-realizationMin);cell.style.color=`hsl(${Math.max(0,Math.min(120,hue))},90%,58%)`;cell.style.fontWeight='700';}}],starterBenchRows);
+renderSortableStatsTable('starterBenchTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},{key:'actual',label:'Actual points (PPG)',render:row=>`${row.actual.toFixed(1)} (${row.actual_ppg.toFixed(1)} PPG)`},{key:'bench',label:'Bench points',render:row=>row.bench.toFixed(1)},{key:'optimal',label:'Optimal lineup points (PPG)',render:row=>`${row.optimal.toFixed(1)} (${row.optimal_ppg.toFixed(1)} PPG)`},{key:'optimal_pct',label:'Realization of Optimal',render:row=>`${row.optimal_pct.toFixed(1)}%`,cellStyle:(cell,row)=>{const hue=realizationMin>=100?120:120*(row.optimal_pct-realizationMin)/Math.max(1,100-realizationMin);cell.style.color=`hsl(${Math.max(0,Math.min(120,hue))},90%,58%)`;cell.style.fontWeight='700';}}],starterBenchRows,'optimal_pct',-1);
 new Chart(document.getElementById('actualOptimalChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Actual points',data:starterBenchRows.map(row=>row.actual),backgroundColor:'#4da3ff',stack:'lineup'},{label:'Optimal points added',data:starterBenchRows.map(row=>Math.max(0,row.optimal-row.actual)),backgroundColor:'#f5a623',stack:'lineup'}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
 const starterBenchMax=Math.max(0,...starterBenchRows.flatMap(row=>[row.actual,row.bench]));
 new Chart(document.getElementById('starterBenchPointsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:[{label:'Starter points',data:starterBenchRows.map(row=>row.actual),backgroundColor:'#4da3ff'},{label:'Bench points',data:starterBenchRows.map(row=>row.bench),backgroundColor:'#f5a623'}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{},y:{beginAtZero:true,max:starterBenchMax?starterBenchMax*1.08:1,title:{display:true,text:'Fantasy points'}}}}});
@@ -1458,6 +1542,24 @@ new Chart(document.getElementById('benchLossChart'),{type:'bar',data:{labels:D.t
 const differentialChart=new Chart(document.getElementById('differentialChart'),{type:'bar',data:{labels:[],datasets:[{label:'Points scored - points allowed',data:[],backgroundColor:[],borderRadius:4},{type:'line',label:'0 points',data:[],borderColor:'#a7b3c2',borderDash:[6,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''},legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Week'}},y:{title:{display:true,text:'Point differential'},ticks:{precision:1}}}}});
 function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+teamAbbrev(team);differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
+const rosterStatsTable=document.getElementById('rosterStatsTable');
+function renderRosterStats(team){
+  const teamId=D.roster_team_ids?.[team],players=D.rosters?.[teamId]||[];
+  rosterStatsTable.className='roster-table';rosterStatsTable.replaceChildren();
+  const caption=document.createElement('caption');caption.className='muted';caption.style.textAlign='left';caption.style.padding='0 8px 8px';caption.textContent='Points vs. initial projection is the sum of actual points minus the initial projection for each completed week.';rosterStatsTable.append(caption);
+  const header=document.createElement('tr');
+  [['','roster-photo-cell'],['Player','roster-player-name'],['Slot',''],['Position',''],['PPG',''],['Points vs. initial projection',''],['Pos. rank',''],['Bye',''],['NFL team','']].forEach(([label,className])=>{const th=document.createElement('th');th.textContent=label;if(className)th.className=className;header.append(th);});rosterStatsTable.append(header);
+  if(!players.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=9;cell.className='roster-empty';cell.textContent='No roster data was returned for this team.';row.append(cell);rosterStatsTable.append(row);return;}
+  players.forEach(player=>{
+    const row=document.createElement('tr');if(player.slot==='BE'||player.slot==='IR')row.className='roster-bench';
+    const photoCell=document.createElement('td');photoCell.className='roster-photo-cell';
+    const image=document.createElement('img');image.className='roster-photo';image.alt=player.name;image.loading='lazy';
+    image.src=player.photo_url||'';image.onerror=()=>{const initials=document.createElement('span');initials.className='roster-photo';initials.style.display='grid';initials.style.placeItems='center';initials.style.fontSize='11px';initials.textContent=String(player.name||'?').split(/\s+/).map(part=>part[0]||'').join('').slice(0,2).toUpperCase();photoCell.replaceChildren(initials);};photoCell.append(image);row.append(photoCell);
+    const values=[player.name,player.slot||'BE',player.position||'—',`${Number(player.ppg||0).toFixed(2)}`,player.projection_delta==null?'—':`${Number(player.projection_delta)>=0?'+':''}${Number(player.projection_delta).toFixed(1)}`,player.pos_rank==null?'—':player.pos_rank,player.bye_week==null?'—':player.bye_week,player.nfl_team||'—'];
+    values.forEach((value,index)=>{const cell=document.createElement('td');cell.textContent=value;if(index===0)cell.className='roster-player-name';if(index===1)cell.className='roster-slot';row.append(cell);});rosterStatsTable.append(row);
+  });
+}
+const rosterButtons=fillTeamButtons('rosterTeams',renderRosterStats);
 const winDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='W');return rows.length?rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
 const lossDiffTotals=D.teams.map(team=>{const rows=(D.weekly_results[team]||[]).filter(row=>row.outcome==='L');return rows.length?-rows.reduce((sum,row)=>sum+Math.abs(Number(row.point_diff)||0),0)/rows.length:0;});
 const overallDiffBound=Math.max(1,...winDiffTotals.map(Math.abs),...lossDiffTotals.map(Math.abs));
@@ -1501,7 +1603,7 @@ const powerChart=new Chart(document.getElementById('powerHistoryChart'),{type:'l
 function highlightPowerTeam(index){powerChart.data.datasets.forEach((dataset,i)=>{dataset.borderColor=index===null?powerColors[i]:(i===index?powerColors[i]:'rgba(160,170,180,.18)');dataset.backgroundColor=dataset.borderColor;dataset.borderWidth=index===i?4:1.5;dataset.pointRadius=index===i?2:0;});powerHighlight.textContent=index===null?'Hover over or click a line to highlight a team.':D.teams[index];powerHighlight.style.color=index===null?'var(--muted)':powerColors[index];powerChart.update('none');}
  const playoffBracket=document.getElementById('playoffBracket'),consolationBracket=document.getElementById('consolationBracket'),playoffNote=document.getElementById('playoffBracketNote');
 function renderPlayoffBracket(){
-  playoffBracket.replaceChildren();consolationBracket.replaceChildren();
+  playoffBracket.replaceChildren();consolationBracket.replaceChildren();playoffBracket.classList.add('bracket');consolationBracket.classList.add('bracket');
   playoffNote.textContent=D.bracket_live_week?`Includes in-progress Week ${D.bracket_live_week} scores; refreshes with dashboard updates.`:'Based on current standings; refreshes with dashboard updates.';
   const entrants=D.playoff_teams||[];
   const consolation=D.consolation_teams||[];
@@ -1540,10 +1642,10 @@ renderSortableStatsTable('qualityTable',[{key:'team',label:'Team',render:row=>te
 const heat=document.getElementById('heat');const hr=document.createElement('tr');['Team',...Array.from({length:D.completed_week},(_,i)=>'W'+(i+1)),'xW','Actual','Luck'].forEach(x=>{const c=document.createElement('th');c.textContent=x;hr.append(c)});heat.append(hr);D.teams.forEach(team=>{const tr=document.createElement('tr');const name=document.createElement('td');name.textContent=teamAbbrev(team);name.title=team;tr.append(name);(D.heat[team]||[]).forEach(v=>{const td=document.createElement('td');td.textContent=v==null?'—':v.toFixed(2);if(v!=null)td.style.background=`hsl(${120*v},65%,45%)`;tr.append(td)});const r=luckData.get(team)||{xw:0,actual:0,luck:0};[r.xw.toFixed(2),r.actual.toFixed(1),(r.luck>=0?'+':'')+r.luck.toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});heat.append(tr)});
 
 let liveGameWindows=[],liveSamplingWindows=[];const gameActivityPlugin={id:'gameActivity',beforeDatasetsDraw(chart){if(chart.canvas.id!=='liveChart'||(!liveGameWindows.length&&!liveSamplingWindows.length))return;const {ctx,chartArea,scales}=chart,xScale=scales.x;if(!chartArea||!xScale)return;const min=Number(xScale.min),max=Number(xScale.max),draw=windows=>{for(const [rawStart,rawEnd] of windows){const start=rawStart<1e12?rawStart*1000:rawStart,end=rawEnd<1e12?rawEnd*1000:rawEnd;if(end<=min||start>=max)continue;const x1=xScale.getPixelForValue(start),x2=xScale.getPixelForValue(end),left=Math.max(chartArea.left,Math.min(x1,x2)),right=Math.min(chartArea.right,Math.max(x1,x2));ctx.fillRect(left,chartArea.top,Math.max(1,right-left),chartArea.bottom-chartArea.top);}};ctx.save();ctx.fillStyle='rgba(77,163,255,.06)';draw(liveSamplingWindows);ctx.fillStyle='rgba(167,179,194,.075)';draw(liveGameWindows);ctx.restore();}};Chart.register(gameActivityPlugin);
- let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{datasets:[{label:'Home win probability',data:[],borderColor:colors[0],backgroundColor:colors[0],fill:{target:{value:50},above:'rgba(245,166,35,.28)',below:'rgba(77,163,255,.25)'},pointRadius:0,borderWidth:2.5,tension:.18},{label:'50%',data:[],borderColor:'#c9d4de',borderDash:[7,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},title:{display:false},tooltip:{filter:item=>item.datasetIndex===0}},interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Home team win probability (%)'}},x:{type:'linear',ticks:{maxTicksLimit:10,maxRotation:0,callback:value=>new Date(value).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'})}}}}});
+ let liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{datasets:[{label:'Win probability',data:[],borderColor:colors[0],backgroundColor:colors[0],fill:{target:{value:50},above:'rgba(245,166,35,.28)',below:'rgba(77,163,255,.25)'},pointRadius:0,borderWidth:2.5,tension:.18},{label:'50%',data:[],borderColor:'#c9d4de',borderDash:[7,5],borderWidth:1.5,pointRadius:0,fill:false}]},options:{maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},title:{display:false},tooltip:{filter:item=>item.datasetIndex===0,callbacks:{title:items=>items.length?new Date(items[0].parsed.x).toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'',label:item=>`${document.getElementById('liveTopTeam').textContent} win probability: ${Number(item.parsed.y).toFixed(1)}%`}}},interaction:{mode:'index',intersect:false},scales:{y:{min:0,max:100,title:{display:true,text:'Home team win probability (%)'}},x:{type:'linear',ticks:{maxTicksLimit:10,maxRotation:0,callback:value=>new Date(value).toLocaleString([],{weekday:'short',hour:'numeric',minute:'2-digit'})}}}}});
  const multiverse=D.fantasy_multiverse||{},multiverseTeamsHost=document.getElementById('multiverseTeams'),multiverseColors=D.teams.map((_,i)=>`hsl(${Math.round(360*i/Math.max(D.teams.length,1))} 78% 58%)`),multiverseBins=Array.from({length:Math.max(1,(multiverse.weeks_used||[]).length+1)},(_,i)=>i),multiverseCounts=multiverse.distributions||{};
  const multiverseSummaryRows=D.teams.map(team=>{const actual=Number(multiverse.actual_wins?.[team]||0),counts=multiverseCounts[team]||[],total=Number(multiverse.simulations||counts.reduce((sum,row)=>sum+Number(row.count||0),0)),weighted=counts.reduce((sum,row)=>sum+Number(row.wins||0)*Number(row.count||0),0),atOrBelow=counts.reduce((sum,row)=>sum+(Number(row.wins||0)<=actual?Number(row.count||0):0),0);return{team,actual_wins:actual,average_wins:total?weighted/total:null,win_percentile:total?100*atOrBelow/total:null};});
- function renderMultiverseSummary(){const table=document.getElementById('multiverseSummaryTable'),cols=[['team','Team'],['actual_wins','Actual wins'],['average_wins','Average wins'],['win_percentile','Wins percentile']];let key='win_percentile',direction=-1;const hueColor=(value,values)=>{if(value===null||value===undefined)return 'var(--muted)';const lo=Math.min(...values.filter(v=>v!=null)),hi=Math.max(...values.filter(v=>v!=null)),ratio=hi>lo?(value-lo)/(hi-lo):1;return `hsl(${120*Math.max(0,Math.min(1,ratio))},85%,58%)`;};function draw(){const ordered=[...multiverseSummaryRows].sort((a,b)=>{const av=a[key],bv=b[key];return (key==='team'?direction*String(av).localeCompare(String(bv)):direction*((av??-Infinity)-(bv??-Infinity)))||D.teams.indexOf(a.team)-D.teams.indexOf(b.team);});table.replaceChildren();const head=document.createElement('tr');cols.forEach(([column,label])=>{const th=document.createElement('th');th.textContent=label+(column===key?(direction<0?' ▼':' ▲'):'');th.className='sortable';th.title='Sort by '+label;th.addEventListener('click',()=>{if(key===column)direction*=-1;else{key=column;direction=column==='team'?1:-1;}draw();});head.append(th);});table.append(head);const colorKeys=['actual_wins','average_wins','win_percentile'],colorValues=Object.fromEntries(colorKeys.map(k=>[k,multiverseSummaryRows.map(row=>row[k])]));ordered.forEach(row=>{const tr=document.createElement('tr');cols.forEach(([column])=>{const td=document.createElement('td');if(column==='team'){td.textContent=teamAbbrev(row.team);td.title=row.team;}else{const value=row[column];td.textContent=value==null?'—':column==='win_percentile'?`${value.toFixed(1)}%`:value.toFixed(2);td.style.color=hueColor(value,colorValues[column]);td.style.fontWeight='700';}tr.append(td);});table.append(tr);});}draw();}
+function renderMultiverseSummary(){const table=document.getElementById('multiverseSummaryTable'),cols=[['team','Team'],['actual_wins','Actual wins'],['average_wins','Average wins'],['win_percentile','Wins percentile']];let key='win_percentile',direction=-1;const hueColor=(value,values)=>{if(value===null||value===undefined)return 'var(--muted)';const lo=Math.min(...values.filter(v=>v!=null)),hi=Math.max(...values.filter(v=>v!=null)),ratio=hi>lo?(value-lo)/(hi-lo):1;return `hsl(${120*Math.max(0,Math.min(1,ratio))},85%,58%)`;};function draw(){const ordered=[...multiverseSummaryRows].sort((a,b)=>{const av=a[key],bv=b[key];return (key==='team'?direction*String(av).localeCompare(String(bv)):direction*((av??-Infinity)-(bv??-Infinity)))||D.teams.indexOf(a.team)-D.teams.indexOf(b.team);});table.replaceChildren();const head=document.createElement('tr');cols.forEach(([column,label])=>{const th=document.createElement('th');th.textContent=label+(column===key?(direction<0?' ▼':' ▲'):'');th.className='sortable';th.title='Sort by '+label;th.addEventListener('click',()=>{if(key===column)direction*=-1;else{key=column;direction=column==='team'?1:-1;}draw();});head.append(th);});table.append(head);const colorKeys=['win_percentile'],colorValues=Object.fromEntries(colorKeys.map(k=>[k,multiverseSummaryRows.map(row=>row[k])]));ordered.forEach(row=>{const tr=document.createElement('tr');cols.forEach(([column])=>{const td=document.createElement('td');if(column==='team'){td.textContent=teamAbbrev(row.team);td.title=row.team;}else{const value=row[column];td.textContent=value==null?'—':column==='win_percentile'?`${value.toFixed(1)}%`:value.toFixed(2);if(colorKeys.includes(column)){td.style.color=hueColor(value,colorValues[column]);td.style.fontWeight='700';}}tr.append(td);});table.append(tr);});}draw();}
  renderMultiverseSummary();
 function multiverseProbability(team){const rows=multiverseCounts[team]||[],total=multiverse.simulations||1;return multiverseBins.map(wins=>{const item=rows.find(row=>row.wins===wins);return item?100*item.count/total:0;});}
 const multiverseMarker={id:'multiverseActualMarker',afterDraw(chart){const actual=chart.$actualWins;if(actual===undefined||actual===null)return;const x=chart.scales.x.getPixelForValue(actual);if(!Number.isFinite(x))return;const {ctx,chartArea}=chart;ctx.save();ctx.strokeStyle='#f5a623';ctx.lineWidth=2;ctx.setLineDash([7,5]);ctx.beginPath();ctx.moveTo(x,chartArea.top);ctx.lineTo(x,chartArea.bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#f5a623';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('Actual: '+actual,x,chartArea.top+14);ctx.restore();}};Chart.register(multiverseMarker);
@@ -1591,6 +1693,10 @@ function renderTrades(selected){
     const meta=document.createElement('p');meta.textContent=`Received: ${side.incoming.map(p=>p.name).join(', ')||'—'} (${side.incoming_points.toFixed(1)} pts) · Sent: ${side.outgoing.map(p=>p.name).join(', ')||'—'} (${side.outgoing_points.toFixed(1)} pts)`;
     const score=document.createElement('p');score.className='metric';score.textContent=`Net yield: ${side.net_points>=0?'+':''}${side.net_points.toFixed(1)} pts${side.points_per_week===null?'':` · ${side.points_per_week>=0?'+':''}${side.points_per_week.toFixed(2)} pts/week`}`;
     info.append(h,meta,score);layout.append(info);
+    const visuals=document.createElement('div');visuals.className='trade-visuals';
+    const flow=document.createElement('div');flow.className='trade-player-flow';
+    function addFlowGroup(label,players){const group=document.createElement('div');group.className='trade-flow-group';const caption=document.createElement('span');caption.className='trade-flow-label';caption.textContent=label;const list=document.createElement('div');list.className='trade-flow-players';(players||[]).forEach(player=>{const item=document.createElement('div');item.className='trade-flow-player';const image=document.createElement('img');image.src=player.photo_url||'';image.alt=player.name;image.loading='lazy';image.onerror=()=>{const fallback=document.createElement('span');fallback.className='roster-photo';fallback.style.display='grid';fallback.style.placeItems='center';fallback.textContent=String(player.name||'?').split(/\s+/).map(part=>part[0]||'').join('').slice(0,2).toUpperCase();item.replaceChildren(fallback,name);};const name=document.createElement('span');name.textContent=player.name;item.append(image,name);list.append(item);});if(!players?.length){const empty=document.createElement('span');empty.className='muted';empty.textContent='—';list.append(empty);}group.append(caption,list);flow.append(group);}
+    addFlowGroup('Sent',side.outgoing);const arrow=document.createElement('span');arrow.className='trade-arrow';arrow.setAttribute('aria-label','traded for');arrow.textContent='→';flow.append(arrow);addFlowGroup('Received',side.incoming);visuals.append(flow);
     const chartBox=document.createElement('div');chartBox.className='trade-mini-chart';
     const rows=side.weekly_points||[];
     if(rows.length){
@@ -1598,7 +1704,7 @@ function renderTrades(selected){
       const chart=new Chart(canvas,{type:'line',data:{labels:rows.map(r=>'W'+r.week),datasets:[{label:'Received players',data:rows.map(r=>r.incoming),borderColor:colors[0],fill:{target:1,above:'rgba(63,185,80,.28)',below:'rgba(248,81,73,.28)'},pointRadius:2,borderWidth:2,tension:.2},{label:'Sent players',data:rows.map(r=>r.outgoing),borderColor:colors[1],pointRadius:2,borderWidth:2,tension:.2}]},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}},tooltip:{mode:'index',intersect:false}},interaction:{mode:'index',intersect:false},scales:{x:{ticks:{font:{size:9},maxRotation:0}},y:{beginAtZero:true,title:{display:true,text:'Points',font:{size:9}},ticks:{font:{size:9}}}}}});
       individualTradeCharts.add(chart);
     }else{chartBox.className+=' muted';chartBox.textContent='No post-trade scoring weeks yet.';chartBox.style.display='grid';chartBox.style.placeItems='center';chartBox.style.fontSize='12px';}
-    layout.append(chartBox);card.append(layout);area.append(card);
+    visuals.append(chartBox);layout.append(visuals);card.append(layout);area.append(card);
   });
 }document.getElementById('tradeNotice').textContent=D.trade_warning;document.getElementById('tradeNotice').style.display=D.trade_warning?'block':'none';const tradeButtons=fillTeamButtons('tradeTeams',renderTrades);
 // Snapshot refresh: the workflow publishes at five-minute intervals.

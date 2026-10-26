@@ -15,9 +15,11 @@ from espn_api.football import League
 LEAGUE_ID = 509033444
 YEAR = 2026
 SIMULATIONS = 5000
-# Wider per-player uncertainty than ESPN's point projection gives by itself.
-PLAYER_SD_MULTIPLIER = 0.90
-PLAYER_SD_FLOOR = 2.0
+# ESPN projections tend to be too certain in the first snapshots of a matchup.
+# Keep uncertainty wider for each player's remaining points, and retain a floor
+# while a game is in progress even when the player has already exceeded projection.
+PLAYER_SD_MULTIPLIER = 1.70
+PLAYER_SD_FLOOR = 3.0
 ROOT = Path(__file__).resolve().parent
 
 
@@ -26,16 +28,23 @@ def _remaining_projection(lineup):
     for player in lineup or []:
         if getattr(player, "slot_position", "") in ("BE", "IR"):
             continue
-        if getattr(player, "game_played", 100) >= 100:
+        try:
+            progress = float(getattr(player, "game_played", 0) or 0)
+        except (TypeError, ValueError):
+            progress = 0.0
+        if progress >= 100:
             continue
         projected = float(getattr(player, "projected_points", 0) or 0)
         scored = float(getattr(player, "points", 0) or 0)
         remaining = max(0.0, projected - scored)
-        if remaining:
+        if remaining or (0 < progress < 100):
             mean += remaining
-            # Approximate each player's remaining score as Normal(R, s²),
-            # where R is the remaining projection and s = max(2, 0.90√R).
-            sd = max(PLAYER_SD_FLOOR, PLAYER_SD_MULTIPLIER * math.sqrt(remaining))
+            # Approximate remaining points with a wider normal distribution.
+            # During an active game, keep uncertainty even if current points
+            # have already passed the player's original full-game projection.
+            active_fraction = max(0.0, min(1.0, 1.0 - progress / 100.0))
+            uncertainty_basis = max(remaining, max(projected, scored, 0.0) * active_fraction)
+            sd = max(PLAYER_SD_FLOOR, PLAYER_SD_MULTIPLIER * math.sqrt(uncertainty_basis))
             variance += sd * sd
     return mean, variance
 
