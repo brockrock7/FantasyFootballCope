@@ -634,7 +634,8 @@ def _activity_trade_rows(league, date_weeks):
     return list(trades.values()), unmatched_dates
 
 
-def _current_rosters(league, completed_week, max_week, acquisition_history, player_weekly_history):
+def _current_rosters(league, completed_week, max_week, acquisition_history,
+                     player_weekly_history, player_scoring_history):
     slot_names = {
         "0": "QB", "2": "RB", "4": "WR", "6": "TE", "16": "D/ST",
         "17": "K", "20": "BE", "21": "IR", "23": "FLEX", "24": "OP",
@@ -684,39 +685,29 @@ def _current_rosters(league, completed_week, max_week, acquisition_history, play
         team_id = str(team.team_id)
         for player in getattr(team, "roster", []) or []:
             player_id = int(getattr(player, "playerId", 0) or 0)
-            stats = getattr(player, "stats", {}) or {}
-            actual_total = 0.0
-            played_games = 0
-            actual_scores = []
-            projection_residuals = []
-            for week in range(1, max(0, int(completed_week)) + 1):
-                weekly = stats.get(week, stats.get(str(week), {})) if isinstance(stats, dict) else {}
-                if not isinstance(weekly, dict):
-                    continue
-                actual = weekly.get("points")
-                projected = weekly.get("projected_points", weekly.get("projectedPoints"))
-                if actual is not None:
-                    actual = _safe_float(actual)
-                    actual_total += actual
-                    actual_scores.append(actual)
-                    if actual > 0:
-                        played_games += 1
-                    if projected is not None:
-                        projection_residuals.append(actual - _safe_float(projected))
+            weekly_rows = list(player_scoring_history.get(player_id, {}).values())
+            actual_scores = [row["actual"] for row in weekly_rows if row["played"]]
+            projection_residuals = [
+                row["actual"] - row["projected"]
+                for row in weekly_rows
+                if row["played"] and row["projected"] is not None
+            ]
             avg_points = _safe_float(getattr(player, "avg_points", 0))
-            ppg = avg_points if avg_points > 0 else (actual_total / played_games if played_games else 0.0)
+            ppg = avg_points if avg_points > 0 else (
+                sum(actual_scores) / len(actual_scores) if actual_scores else 0.0
+            )
             points_vs_projection_ppg = (
                 sum(projection_residuals) / len(projection_residuals) if projection_residuals else None
             )
-            projection_variance_avg = (
-                sum(abs(value) for value in projection_residuals) / len(projection_residuals)
-                if projection_residuals else None
-            )
-            score_mean = sum(actual_scores) / len(actual_scores) if actual_scores else 0.0
-            raw_variance = (
-                sum((value - score_mean) ** 2 for value in actual_scores) / len(actual_scores)
-                if actual_scores else None
-            )
+
+            def sample_variance(values):
+                if len(values) < 2:
+                    return None
+                mean = sum(values) / len(values)
+                return sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+
+            projection_variance = sample_variance(projection_residuals)
+            raw_variance = sample_variance(actual_scores)
             team_player_history = player_weekly_history.get((team_id, player_id), [])
             started_points = sum(row["points"] for row in team_player_history if row["started"])
             nonstarter_points = sum(row["points"] for row in team_player_history if not row["started"])
@@ -755,8 +746,12 @@ def _current_rosters(league, completed_week, max_week, acquisition_history, play
                 "slot": slot_label(player),
                 "ppg": round(ppg, 2),
                 "points_vs_projection_ppg": round(points_vs_projection_ppg, 2) if points_vs_projection_ppg is not None else None,
-                "projection_variance_avg": round(projection_variance_avg, 2) if projection_variance_avg is not None else None,
+                "projection_variance": round(projection_variance, 2) if projection_variance is not None else None,
+                "projection_sd": round(math.sqrt(projection_variance), 2) if projection_variance is not None else None,
                 "raw_variance": round(raw_variance, 2) if raw_variance is not None else None,
+                "raw_sd": round(math.sqrt(raw_variance), 2) if raw_variance is not None else None,
+                "score_games": len(actual_scores),
+                "projection_games": len(projection_residuals),
                 "realized_pct": round(realized_pct, 1) if realized_pct is not None else None,
                 "started_points": round(started_points, 2),
                 "nonstarter_points": round(nonstarter_points, 2),
@@ -1044,6 +1039,7 @@ def _build_payload(league):
     source_audit = Counter()
     acquisition_history = _weekly_transaction_acquisitions(league, max_week)
     player_weekly_history = defaultdict(list)
+    player_scoring_history = defaultdict(dict)
 
     for week in range(1, max_week + 1):
         matchups = league.box_scores(week)
@@ -1088,6 +1084,29 @@ def _build_payload(league):
                     points = _safe_float(getattr(player, "points", 0))
                     player_id = int(getattr(player, "playerId", 0) or 0)
                     if week <= completed_week and player_id > 0:
+                        player_stats = getattr(player, "stats", {}) or {}
+                        weekly_stats = (
+                            player_stats.get(week, player_stats.get(str(week), {}))
+                            if isinstance(player_stats, dict) else {}
+                        )
+                        weekly_stats = weekly_stats if isinstance(weekly_stats, dict) else {}
+                        projected_value = weekly_stats.get(
+                            "projected_points", weekly_stats.get("projectedPoints")
+                        )
+                        if projected_value is None:
+                            projected_value = getattr(player, "projected_points", None)
+                        projected_value = _safe_float(projected_value) if projected_value is not None else None
+                        # ESPN uses a zero default when a weekly projection is absent.
+                        # Treat that as missing so it cannot inflate the projection gap.
+                        if projected_value is not None and projected_value <= 0:
+                            projected_value = None
+                        actual_value = weekly_stats.get("points")
+                        actual_value = _safe_float(actual_value) if actual_value is not None else points
+                        player_scoring_history[player_id].setdefault(week, {
+                            "actual": actual_value,
+                            "projected": projected_value,
+                            "played": not bool(getattr(player, "on_bye_week", False)),
+                        })
                         player_weekly_history[(str(tid), player_id)].append({
                             "week": week,
                             "points": points,
@@ -1139,7 +1158,8 @@ def _build_payload(league):
             print(f"Could not load completed playoff scores for week {week}: {exc}")
 
     current_rosters = _current_rosters(
-        league, completed_week, max_week, acquisition_history, player_weekly_history
+        league, completed_week, max_week, acquisition_history,
+        player_weekly_history, player_scoring_history,
     )
     df = pd.DataFrame(score_rows)
     if not df.empty and "xw" not in df.columns:
@@ -1609,9 +1629,9 @@ function projectionPpgColor(value){const normalized=Math.max(-1,Math.min(1,Numbe
 function renderRosterStats(team){
   const teamId=D.roster_team_ids?.[team],players=D.rosters?.[teamId]||[];
   rosterStatsTable.className='roster-table';rosterStatsTable.replaceChildren();
-  const caption=document.createElement('caption');caption.className='muted';caption.style.textAlign='left';caption.style.padding='0 8px 8px';caption.textContent='Points vs. Initial Projections is average actual minus projection per week. Variance vs. Initial Projections is the average absolute weekly miss. Raw Variance is population variance in weekly scores. Realized Points uses only weeks on this team.';rosterStatsTable.append(caption);
+  const caption=document.createElement('caption');caption.className='muted';caption.style.textAlign='left';caption.style.padding='0 8px 8px';caption.textContent='Points vs. Initial Projections is the average weekly actual-minus-projection gap (PPG). Variance columns use sample variance; standard deviation is shown in parentheses. They use completed player game weeks in the league matchup logs. A dash means fewer than two observations for variance. Realized Points uses only weeks on this team.';rosterStatsTable.append(caption);
   const header=document.createElement('tr');
-  const columns=[['Player','Player name and public headshot'],['Slot','Current lineup slot; BE and IR rows are bench/nonstarters'],['Position','Player position'],['PPG','Season points per game'],['Points vs. Initial Projections (PPG)','Average signed actual points minus initial projection per completed week'],['Variance vs. Initial Projections','Average absolute weekly difference between actual points and projection'],['Raw Variance','Population variance of weekly fantasy points, in points squared'],['Pos. Rank','ESPN position rank'],['Acquisition','How the player joined this roster and acquisition week when known'],['NFL Team','Player’s NFL team'],['Bye','NFL bye week'],['% Realized Points','Percent of points scored while in this team’s starting lineup; hover for the starting and bench points']];
+  const columns=[['Player','Player name and public headshot'],['Slot','Current lineup slot; BE and IR rows are bench/nonstarters'],['Position','Player position'],['PPG','Season points per game'],['Points vs. Initial Projections (PPG)','Average signed actual points minus initial projection per played week'],['Variance vs. Initial Projections','Sample variance of weekly actual-minus-projection gaps (points²); standard deviation appears in parentheses (points)'],['Raw Variance','Sample variance of weekly actual points (points²); standard deviation appears in parentheses (points)'],['Pos. Rank','ESPN position rank'],['Acquisition','How the player joined this roster and acquisition week when known'],['NFL Team','Player’s NFL team'],['Bye','NFL bye week'],['% Realized Points','Percent of points scored while in this team’s starting lineup; hover for the starting and bench points']];
   columns.forEach(([label,title])=>{const th=document.createElement('th');th.textContent=label;th.title=title;header.append(th);});rosterStatsTable.append(header);
   if(!players.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=12;cell.className='roster-empty';cell.textContent='No roster data was returned for this team.';row.append(cell);rosterStatsTable.append(row);return;}
   let hasStarter=false,dividerAdded=false;
@@ -1624,8 +1644,8 @@ function renderRosterStats(team){
     const image=document.createElement('img');image.className='roster-photo';image.alt=player.name;image.loading='lazy';
     image.src=player.photo_url||'';image.onerror=()=>{const initials=document.createElement('span');initials.className='roster-photo roster-avatar-fallback';initials.textContent=String(player.name||'?').split(/\s+/).map(part=>part[0]||'').join('').slice(0,2).toUpperCase();playerDisplay.replaceChild(initials,image);};
     const playerName=document.createElement('span');playerName.textContent=player.name;playerDisplay.append(image,playerName);playerCell.append(playerDisplay);row.append(playerCell);
-    const values=[slot,player.position||'—',`${Number(player.ppg||0).toFixed(2)}`,player.points_vs_projection_ppg==null?'—':`${Number(player.points_vs_projection_ppg)>=0?'+':''}${Number(player.points_vs_projection_ppg).toFixed(2)}`,player.projection_variance_avg==null?'—':`${Number(player.projection_variance_avg).toFixed(2)} pts`,player.raw_variance==null?'—':`${Number(player.raw_variance).toFixed(2)} pts²`,player.pos_rank==null?'—':player.pos_rank];
-    values.forEach((value,index)=>{const cell=document.createElement('td');cell.textContent=value;if(index===0)cell.className='roster-slot';if(index===3&&player.points_vs_projection_ppg!=null){cell.style.color=projectionPpgColor(player.points_vs_projection_ppg);cell.style.fontWeight='750';}row.append(cell);});
+    const values=[slot,player.position||'—',`${Number(player.ppg||0).toFixed(2)}`,player.points_vs_projection_ppg==null?'—':`${Number(player.points_vs_projection_ppg)>=0?'+':''}${Number(player.points_vs_projection_ppg).toFixed(2)}`,player.projection_variance==null?'—':`${Number(player.projection_variance).toFixed(2)} pts²`,player.raw_variance==null?'—':`${Number(player.raw_variance).toFixed(2)} pts²`,player.pos_rank==null?'—':player.pos_rank];
+    values.forEach((value,index)=>{const cell=document.createElement('td');cell.textContent=value;if(index===0)cell.className='roster-slot';if(index===3&&player.points_vs_projection_ppg!=null){cell.style.color=projectionPpgColor(player.points_vs_projection_ppg);cell.style.fontWeight='750';}if(index===4||index===5){const deviation=index===4?player.projection_sd:player.raw_sd;const observations=index===4?player.projection_games:player.score_games;if(deviation!=null){const detail=document.createElement('small');detail.textContent=` (SD ${Number(deviation).toFixed(2)} pts)`;detail.style.fontSize='.8em';detail.style.color='var(--muted)';cell.append(detail);}cell.title=`Sample variance from ${Number(observations||0)} completed game week(s)`;}row.append(cell);});
     const acquisitionCell=document.createElement('td'),acquisition=document.createElement('span');acquisition.textContent=player.acquisition==='Traded'?'Traded for':player.acquisition==='Waivers'?'Acquired':(player.acquisition||'—');acquisitionCell.append(acquisition);if(player.acquisition&&player.acquisition!=='Drafted'&&player.acquisition_week!=null){const week=document.createElement('span');week.className='acquisition-week';week.textContent=` (W${player.acquisition_week})`;acquisitionCell.append(week);}acquisitionCell.title=player.acquisition_week==null?'':`Joined this roster in Week ${player.acquisition_week}`;row.append(acquisitionCell);
     const nflCell=document.createElement('td');nflCell.textContent=player.nfl_team||'—';row.append(nflCell);
     const byeCell=document.createElement('td');byeCell.textContent=player.bye_week==null?'—':player.bye_week;if(Number(player.bye_week)===Number(D.current_week)){byeCell.style.color='#f85149';byeCell.style.fontWeight='800';byeCell.title='Bye week is this week';}row.append(byeCell);
