@@ -634,7 +634,7 @@ def _activity_trade_rows(league, date_weeks):
     return list(trades.values()), unmatched_dates
 
 
-def _current_rosters(league, completed_week):
+def _current_rosters(league, completed_week, max_week, acquisition_history, player_weekly_history):
     slot_names = {
         "0": "QB", "2": "RB", "4": "WR", "6": "TE", "16": "D/ST",
         "17": "K", "20": "BE", "21": "IR", "23": "FLEX", "24": "OP",
@@ -681,11 +681,14 @@ def _current_rosters(league, completed_week):
     result = {}
     for team in league.teams:
         players = []
+        team_id = str(team.team_id)
         for player in getattr(team, "roster", []) or []:
             player_id = int(getattr(player, "playerId", 0) or 0)
             stats = getattr(player, "stats", {}) or {}
-            actual_total = projection_delta = 0.0
-            played_games = projection_weeks = 0
+            actual_total = 0.0
+            played_games = 0
+            actual_scores = []
+            projection_residuals = []
             for week in range(1, max(0, int(completed_week)) + 1):
                 weekly = stats.get(week, stats.get(str(week), {})) if isinstance(stats, dict) else {}
                 if not isinstance(weekly, dict):
@@ -695,13 +698,50 @@ def _current_rosters(league, completed_week):
                 if actual is not None:
                     actual = _safe_float(actual)
                     actual_total += actual
+                    actual_scores.append(actual)
                     if actual > 0:
                         played_games += 1
                     if projected is not None:
-                        projection_delta += actual - _safe_float(projected)
-                        projection_weeks += 1
+                        projection_residuals.append(actual - _safe_float(projected))
             avg_points = _safe_float(getattr(player, "avg_points", 0))
             ppg = avg_points if avg_points > 0 else (actual_total / played_games if played_games else 0.0)
+            points_vs_projection_ppg = (
+                sum(projection_residuals) / len(projection_residuals) if projection_residuals else None
+            )
+            projection_variance_avg = (
+                sum(abs(value) for value in projection_residuals) / len(projection_residuals)
+                if projection_residuals else None
+            )
+            score_mean = sum(actual_scores) / len(actual_scores) if actual_scores else 0.0
+            raw_variance = (
+                sum((value - score_mean) ** 2 for value in actual_scores) / len(actual_scores)
+                if actual_scores else None
+            )
+            team_player_history = player_weekly_history.get((team_id, player_id), [])
+            started_points = sum(row["points"] for row in team_player_history if row["started"])
+            nonstarter_points = sum(row["points"] for row in team_player_history if not row["started"])
+            team_points = started_points + nonstarter_points
+            realized_pct = 100.0 * started_points / team_points if team_points > 0 else None
+
+            ownership_rows = [
+                (week, acquisition_history.get(week, {}).get((team_id, player_id)))
+                for week in range(1, max(0, int(max_week)) + 1)
+                if (team_id, player_id) in acquisition_history.get(week, {})
+            ]
+            acquisition = ownership_rows[-1][1] if ownership_rows else _source_bucket(
+                getattr(player, "acquisitionType", "")
+            )
+            if acquisition == "Unknown":
+                acquisition = "Waivers"
+            acquisition_week = None
+            if ownership_rows and acquisition != "Drafted":
+                latest_week = ownership_rows[-1][0]
+                acquisition_week = latest_week
+                for week in range(latest_week - 1, 0, -1):
+                    previous_source = acquisition_history.get(week, {}).get((team_id, player_id))
+                    if previous_source != acquisition:
+                        break
+                    acquisition_week = week
             pos_rank = getattr(player, "posRank", None) or getattr(player, "position_rank", None)
             try:
                 pos_rank = int(pos_rank) if pos_rank is not None else None
@@ -714,7 +754,14 @@ def _current_rosters(league, completed_week):
                 "position": str(getattr(player, "position", "—")),
                 "slot": slot_label(player),
                 "ppg": round(ppg, 2),
-                "projection_delta": round(projection_delta, 2) if projection_weeks else None,
+                "points_vs_projection_ppg": round(points_vs_projection_ppg, 2) if points_vs_projection_ppg is not None else None,
+                "projection_variance_avg": round(projection_variance_avg, 2) if projection_variance_avg is not None else None,
+                "raw_variance": round(raw_variance, 2) if raw_variance is not None else None,
+                "realized_pct": round(realized_pct, 1) if realized_pct is not None else None,
+                "started_points": round(started_points, 2),
+                "nonstarter_points": round(nonstarter_points, 2),
+                "acquisition": acquisition,
+                "acquisition_week": acquisition_week if acquisition != "Drafted" else None,
                 "pos_rank": pos_rank,
                 "bye_week": bye_week(player),
                 "nfl_team": str(nfl_team),
@@ -725,7 +772,13 @@ def _current_rosters(league, completed_week):
                     - _safe_float(getattr(player, "total_points", 0)),
                 ), 1),
             })
-        players.sort(key=lambda item: (slot_order.get(item["slot"], 100), item["name"].casefold()))
+        # Keep every starter above the bench so the table can draw one clear
+        # divider even when the league uses defensive individual player slots.
+        players.sort(key=lambda item: (
+            item["slot"] in ("BE", "IR"),
+            slot_order.get(item["slot"], 100),
+            item["name"].casefold(),
+        ))
         result[str(team.team_id)] = players
     return result
 
@@ -982,8 +1035,6 @@ def _build_payload(league):
     current_week = int(league.current_week)
     max_week = min(max(current_week, 1), regular_season_count)
     completed_week = min(max(int(league.current_week) - 1, 0), max_week)
-    current_rosters = _current_rosters(league, completed_week)
-
     score_rows = []
     position_week = defaultdict(lambda: defaultdict(lambda: {g: 0.0 for g in GROUPS}))
     position_totals = defaultdict(lambda: {g: 0.0 for g in GROUPS})
@@ -992,6 +1043,7 @@ def _build_payload(league):
     postseason_score_rows = []
     source_audit = Counter()
     acquisition_history = _weekly_transaction_acquisitions(league, max_week)
+    player_weekly_history = defaultdict(list)
 
     for week in range(1, max_week + 1):
         matchups = league.box_scores(week)
@@ -1033,13 +1085,19 @@ def _build_payload(league):
                     }
                 for player in lineup or []:
                     slot = getattr(player, "slot_position", "")
+                    points = _safe_float(getattr(player, "points", 0))
+                    player_id = int(getattr(player, "playerId", 0) or 0)
+                    if week <= completed_week and player_id > 0:
+                        player_weekly_history[(str(tid), player_id)].append({
+                            "week": week,
+                            "points": points,
+                            "started": slot not in ("BE", "IR", ""),
+                        })
                     pos = _bucket(getattr(player, "position", ""), slot)
                     if pos is None:
                         continue
-                    points = _safe_float(getattr(player, "points", 0))
                     position_week[name][week][pos] += points
                     position_totals[name][pos] += points
-                    player_id = int(getattr(player, "playerId", 0) or 0)
                     source = (
                         acquisition_history.get(week, {}).get((str(tid), player_id))
                         or id_to_source.get((str(tid), player_id))
@@ -1080,6 +1138,9 @@ def _build_payload(league):
         except Exception as exc:
             print(f"Could not load completed playoff scores for week {week}: {exc}")
 
+    current_rosters = _current_rosters(
+        league, completed_week, max_week, acquisition_history, player_weekly_history
+    )
     df = pd.DataFrame(score_rows)
     if not df.empty and "xw" not in df.columns:
         df["xw"] = pd.NA
@@ -1442,7 +1503,7 @@ def _html(payload):
 :root{color-scheme:dark;--bg:#0f1419;--panel:#161d26;--line:#243040;--muted:#8b98a5;--text:#e6edf3;--blue:#4da3ff;--gold:#f5a623;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px 16px 56px}h1{font-size:27px;margin:0}.sub{color:var(--muted);margin:4px 0 20px}.tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:18px}.tab{background:transparent;color:var(--muted);border:0;border-bottom:3px solid transparent;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer}.tab.active{color:var(--text);border-color:var(--blue)}.panel{display:none}.panel.active{display:block}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px;min-width:0}.card h2{font-size:18px;margin:0 0 4px}.card p{font-size:13px;color:var(--muted);margin:0 0 12px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 14px}select,button,input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font:inherit}button{cursor:pointer}.chartbox{height:390px;position:relative}.radar-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.rcell{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}.rcell h3{text-align:center;margin:0 0 7px;font-size:14px}.rbox{height:210px;position:relative}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:center;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted)}td:first-child,th:first-child{text-align:left;white-space:nowrap}.notice{border:1px solid #745d24;background:#2a2418;color:#f3d58b;padding:11px 13px;border-radius:10px;margin:10px 0}.good{border-color:#2c6840;background:#17291c;color:#9be5aa}.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trade-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}.trade-card-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,38%);gap:16px;align-items:center}.trade-card-info{min-width:0}.trade-mini-chart{height:190px;position:relative;min-width:0}.team-trade-chart{height:320px;position:relative}.badge{display:inline-block;border-radius:999px;padding:4px 9px;background:#233141;color:#a8d2ff;font-size:12px;font-weight:700}.badge.gm{background:#183820;color:#8cec9c}.badge.fleeced{background:#3a1d1d;color:#ff9c96}.badge.inmix{background:#25313b;color:#c8d1d9}.player-select{min-height:155px;width:100%}.metric{font-weight:700}.muted{color:var(--muted)}.calculator-result{font-size:17px;margin-top:12px}@media(max-width:760px){.trade-card-layout{grid-template-columns:1fr}.trade-mini-chart{height:210px}}@media(max-width:900px){.radar-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.chartbox{height:330px}}@media(max-width:520px){.wrap{padding:15px 10px}.tab{padding:10px 8px;font-size:13px}.radar-grid{grid-template-columns:1fr}.chartbox{height:290px}.team-trade-chart{height:280px}}
 <style>
-.bracket-scroll.bracket{min-width:0}.trade-card-layout{grid-template-columns:minmax(0,1fr) minmax(390px,1.35fr)}.trade-visuals{display:grid;grid-template-columns:minmax(115px,.45fr) minmax(230px,1fr);gap:12px;align-items:center;min-width:0}.trade-player-flow{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0}.trade-flow-group{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}.trade-flow-label{font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase}.trade-flow-players{display:flex;flex-direction:column;align-items:center;gap:5px}.trade-flow-player{display:flex;flex-direction:column;align-items:center;gap:2px;max-width:70px;text-align:center;font-size:9px;line-height:1.15}.trade-flow-player img,.roster-photo{width:38px;height:38px;object-fit:cover;border-radius:50%;background:#263342;border:1px solid var(--line)}.trade-arrow{font-size:22px;color:var(--blue);font-weight:800}.roster-table th,.roster-table td{text-align:left!important;white-space:nowrap}.roster-table .roster-player-name{min-width:150px}.roster-table .roster-slot{font-weight:700;color:var(--blue)}.roster-table tr.roster-bench{opacity:.78}.roster-photo-cell{width:54px}.roster-photo{display:block;width:42px;height:42px}.roster-empty{padding:18px;color:var(--muted)}
+.bracket-scroll.bracket{min-width:0}.trade-card-layout{grid-template-columns:minmax(0,1fr) minmax(390px,1.35fr)}.trade-visuals{display:grid;grid-template-columns:minmax(115px,.45fr) minmax(230px,1fr);gap:12px;align-items:center;min-width:0}.trade-player-flow{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0}.trade-flow-group{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}.trade-flow-label{font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase}.trade-flow-players{display:flex;flex-direction:column;align-items:center;gap:5px}.trade-flow-player{display:flex;flex-direction:column;align-items:center;gap:2px;max-width:70px;text-align:center;font-size:9px;line-height:1.15}.trade-flow-player img,.roster-photo{width:38px;height:38px;object-fit:cover;border-radius:50%;background:#263342;border:1px solid var(--line)}.trade-arrow{font-size:22px;color:var(--blue);font-weight:800}.roster-table th,.roster-table td{text-align:left!important;white-space:nowrap}.roster-table .roster-player-name{min-width:150px}.roster-table .roster-slot{font-weight:700;color:var(--blue)}.roster-table tr.roster-bench{opacity:.78}.roster-player-cell{display:flex;align-items:center;gap:9px;min-width:180px}.roster-bench-start td{border-top:2px solid var(--text)!important}.acquisition-week{font-size:.8em;color:var(--muted)}.roster-photo-cell{width:54px}.roster-photo{display:block;width:42px;height:42px}.roster-empty{padding:18px;color:var(--muted)}
 @media(max-width:900px){.trade-card-layout{grid-template-columns:1fr}.trade-visuals{grid-template-columns:minmax(130px,.4fr) minmax(220px,1fr)}}@media(max-width:560px){.trade-visuals{grid-template-columns:1fr}.trade-player-flow{justify-content:flex-start}.trade-flow-players{flex-direction:row;flex-wrap:wrap}.trade-mini-chart{height:210px}}
 </style></head><body><main class="wrap">
 <h1>Fielding of (football) dreams</h1><div class="sub" id="subtitle"></div>
@@ -1542,20 +1603,34 @@ const differentialChart=new Chart(document.getElementById('differentialChart'),{
 function showDifferential(team){const rows=D.weekly_results[team]||[],values=rows.map(r=>r.point_diff),bound=Math.max(1,...values.map(v=>Math.abs(v)));differentialChart.options.plugins.title.text='Win/Loss Differential by week - '+teamAbbrev(team);differentialChart.options.scales.y.min=-bound;differentialChart.options.scales.y.max=bound;differentialChart.data.labels=rows.map(r=>'W'+r.week);differentialChart.data.datasets[0].data=values;differentialChart.data.datasets[0].backgroundColor=rows.map(r=>r.outcome==='W'?'#3fb950':r.outcome==='L'?'#f85149':'#a7b3c2');differentialChart.data.datasets[1].data=values.map(()=>0);differentialChart.update();}
 const differentialButtons=fillTeamButtons('differentialTeams',showDifferential);
 const rosterStatsTable=document.getElementById('rosterStatsTable');
+const allRosterPlayers=D.teams.flatMap(team=>D.rosters?.[D.roster_team_ids?.[team]]||[]);
+const maxProjectionPpg=Math.max(1,...allRosterPlayers.map(player=>Math.abs(Number(player.points_vs_projection_ppg)||0)));
+function projectionPpgColor(value){const normalized=Math.max(-1,Math.min(1,Number(value||0)/maxProjectionPpg));return `hsl(${60+60*normalized},88%,58%)`;}
 function renderRosterStats(team){
   const teamId=D.roster_team_ids?.[team],players=D.rosters?.[teamId]||[];
   rosterStatsTable.className='roster-table';rosterStatsTable.replaceChildren();
-  const caption=document.createElement('caption');caption.className='muted';caption.style.textAlign='left';caption.style.padding='0 8px 8px';caption.textContent='Points vs. initial projection is the sum of actual points minus the initial projection for each completed week.';rosterStatsTable.append(caption);
+  const caption=document.createElement('caption');caption.className='muted';caption.style.textAlign='left';caption.style.padding='0 8px 8px';caption.textContent='Points vs. Initial Projections is average actual minus projection per week. Variance vs. Initial Projections is the average absolute weekly miss. Raw Variance is population variance in weekly scores. Realized Points uses only weeks on this team.';rosterStatsTable.append(caption);
   const header=document.createElement('tr');
-  [['','roster-photo-cell'],['Player','roster-player-name'],['Slot',''],['Position',''],['PPG',''],['Points vs. initial projection',''],['Pos. rank',''],['Bye',''],['NFL team','']].forEach(([label,className])=>{const th=document.createElement('th');th.textContent=label;if(className)th.className=className;header.append(th);});rosterStatsTable.append(header);
-  if(!players.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=9;cell.className='roster-empty';cell.textContent='No roster data was returned for this team.';row.append(cell);rosterStatsTable.append(row);return;}
+  const columns=[['Player','Player name and public headshot'],['Slot','Current lineup slot; BE and IR rows are bench/nonstarters'],['Position','Player position'],['PPG','Season points per game'],['Points vs. Initial Projections (PPG)','Average signed actual points minus initial projection per completed week'],['Variance vs. Initial Projections','Average absolute weekly difference between actual points and projection'],['Raw Variance','Population variance of weekly fantasy points, in points squared'],['Pos. Rank','ESPN position rank'],['Acquisition','How the player joined this roster and acquisition week when known'],['NFL Team','Player’s NFL team'],['Bye','NFL bye week'],['% Realized Points','Percent of points scored while in this team’s starting lineup; hover for the starting and bench points']];
+  columns.forEach(([label,title])=>{const th=document.createElement('th');th.textContent=label;th.title=title;header.append(th);});rosterStatsTable.append(header);
+  if(!players.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=12;cell.className='roster-empty';cell.textContent='No roster data was returned for this team.';row.append(cell);rosterStatsTable.append(row);return;}
+  let hasStarter=false,dividerAdded=false;
   players.forEach(player=>{
-    const row=document.createElement('tr');if(player.slot==='BE'||player.slot==='IR')row.className='roster-bench';
-    const photoCell=document.createElement('td');photoCell.className='roster-photo-cell';
+    const slot=player.slot||'BE',isNonstarter=slot==='BE'||slot==='IR';
+    if(!isNonstarter)hasStarter=true;
+    const row=document.createElement('tr');if(isNonstarter)row.classList.add('roster-bench');
+    if(isNonstarter&&hasStarter&&!dividerAdded){row.classList.add('roster-bench-start');dividerAdded=true;}
+    const playerCell=document.createElement('td'),playerDisplay=document.createElement('div');playerDisplay.className='roster-player-cell';
     const image=document.createElement('img');image.className='roster-photo';image.alt=player.name;image.loading='lazy';
-    image.src=player.photo_url||'';image.onerror=()=>{const initials=document.createElement('span');initials.className='roster-photo';initials.style.display='grid';initials.style.placeItems='center';initials.style.fontSize='11px';initials.textContent=String(player.name||'?').split(/\s+/).map(part=>part[0]||'').join('').slice(0,2).toUpperCase();photoCell.replaceChildren(initials);};photoCell.append(image);row.append(photoCell);
-    const values=[player.name,player.slot||'BE',player.position||'—',`${Number(player.ppg||0).toFixed(2)}`,player.projection_delta==null?'—':`${Number(player.projection_delta)>=0?'+':''}${Number(player.projection_delta).toFixed(1)}`,player.pos_rank==null?'—':player.pos_rank,player.bye_week==null?'—':player.bye_week,player.nfl_team||'—'];
-    values.forEach((value,index)=>{const cell=document.createElement('td');cell.textContent=value;if(index===0)cell.className='roster-player-name';if(index===1)cell.className='roster-slot';row.append(cell);});rosterStatsTable.append(row);
+    image.src=player.photo_url||'';image.onerror=()=>{const initials=document.createElement('span');initials.className='roster-photo roster-avatar-fallback';initials.textContent=String(player.name||'?').split(/\s+/).map(part=>part[0]||'').join('').slice(0,2).toUpperCase();playerDisplay.replaceChild(initials,image);};
+    const playerName=document.createElement('span');playerName.textContent=player.name;playerDisplay.append(image,playerName);playerCell.append(playerDisplay);row.append(playerCell);
+    const values=[slot,player.position||'—',`${Number(player.ppg||0).toFixed(2)}`,player.points_vs_projection_ppg==null?'—':`${Number(player.points_vs_projection_ppg)>=0?'+':''}${Number(player.points_vs_projection_ppg).toFixed(2)}`,player.projection_variance_avg==null?'—':`${Number(player.projection_variance_avg).toFixed(2)} pts`,player.raw_variance==null?'—':`${Number(player.raw_variance).toFixed(2)} pts²`,player.pos_rank==null?'—':player.pos_rank];
+    values.forEach((value,index)=>{const cell=document.createElement('td');cell.textContent=value;if(index===0)cell.className='roster-slot';if(index===3&&player.points_vs_projection_ppg!=null){cell.style.color=projectionPpgColor(player.points_vs_projection_ppg);cell.style.fontWeight='750';}row.append(cell);});
+    const acquisitionCell=document.createElement('td'),acquisition=document.createElement('span');acquisition.textContent=player.acquisition==='Traded'?'Traded for':player.acquisition==='Waivers'?'Acquired':(player.acquisition||'—');acquisitionCell.append(acquisition);if(player.acquisition&&player.acquisition!=='Drafted'&&player.acquisition_week!=null){const week=document.createElement('span');week.className='acquisition-week';week.textContent=` (W${player.acquisition_week})`;acquisitionCell.append(week);}acquisitionCell.title=player.acquisition_week==null?'':`Joined this roster in Week ${player.acquisition_week}`;row.append(acquisitionCell);
+    const nflCell=document.createElement('td');nflCell.textContent=player.nfl_team||'—';row.append(nflCell);
+    const byeCell=document.createElement('td');byeCell.textContent=player.bye_week==null?'—':player.bye_week;if(Number(player.bye_week)===Number(D.current_week)){byeCell.style.color='#f85149';byeCell.style.fontWeight='800';byeCell.title='Bye week is this week';}row.append(byeCell);
+    const realizedCell=document.createElement('td');realizedCell.textContent=player.realized_pct==null?'—':`${Number(player.realized_pct).toFixed(1)}%`;realizedCell.title=player.realized_pct==null?'No points scored while on this team':`Started: ${Number(player.started_points||0).toFixed(1)} points · on bench: ${Number(player.nonstarter_points||0).toFixed(1)} points`;row.append(realizedCell);
+    rosterStatsTable.append(row);
   });
 }
 const rosterButtons=fillTeamButtons('rosterTeams',renderRosterStats);
