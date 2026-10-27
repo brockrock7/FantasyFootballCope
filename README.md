@@ -1,17 +1,34 @@
-# Fantasy dashboard update
+# Fantasy football dashboard
 
-This package updates the ESPN Fantasy dashboard with four tabs:
+This ESPN Fantasy dashboard includes:
 
-- **Team Stats**: season position radars, per-team weekly position bars, and per-team weekly drafted/traded/waivers point bars. Unrecognized acquisition types are shown separately as **Unknown**.
-- **Luck**: cumulative expected vs. actual wins, weekly expected-win heatmap, and league schedule-luck ranking.
-- **Live Win %**: matchup win-probability histories with a week picker. Snapshots are appended by GitHub Actions every five minutes and the page checks for fresh data once per minute.
-- **Trades**: completed trade ledger, realized points and points per week for each side, team ratings, and an ESPN-projection trade calculator.
+- **League Stats**: standings sorted by playoff position, playoff markers, power rankings, and a projected playoff/consolation bracket.
+- **Matchup stats**: win-probability history from live snapshots. GitHub Actions collects snapshots every five minutes, and the page checks for fresh data once per minute.
+- **Team Stats**: positional and acquisition breakdowns, starter/bench results, and season-long roster player statistics.
+- **Luck Stats**: expected wins, schedule luck, and simulated schedule outcomes.
+- **Trades** and **Leaderboard**: completed trade records, trade impact, and season leaders.
 
-The live probability and trade calculator are estimates. Win probability uses a simple simulation of remaining ESPN projections. The trade calculator compares projected remaining season points. Trade impact counts players' actual fantasy points in scoring weeks after the trade week.
+Roster averages and standard deviations use a player's completed scoring weeks across all fantasy teams and exclude NFL bye weeks. D/ST rows use NFL team logos when ESPN provides a recognizable team name or abbreviation.
+
+The live probability and trade calculator are estimates. Win probability uses a simulation of remaining ESPN projections. The trade calculator compares projected remaining season points. Trade impact counts players' actual fantasy points in scoring weeks after the trade week.
+
+## League-format portability
+
+Before adapting the dashboard to another league, keep these settings data-driven rather than assuming this league's values:
+
+- Team count, team identifiers, display names, division membership, and team-name abbreviations.
+- Playoff qualifiers, division-winner priority, seed tiebreakers, number of byes, consolation rules, reseeding, and matchup length.
+- Scoring settings such as PPR, half-PPR, bonuses, fractional scoring, TE premium, and defensive scoring.
+- Roster slots and player eligibility, including FLEX, superflex/2QB, tight-end premium, and IDP positions.
+- Regular-season length, matchup periods that span multiple NFL weeks, NFL bye weeks, postponed games, and stat corrections.
+- Stable player IDs and historical roster ownership so a player's season totals do not reset after a trade or waiver move.
+- Team names that truncate cleanly, unique short labels, table width on phones, and chart labels when a league has many teams.
+
+For another platform, keep its API/data collection separate from the dashboard calculations and map its league, team, player, scoring, roster, schedule, and playoff settings into a shared normalized payload.
 
 ## Update the existing repository
 
-Copy these files into the root of `FantasyFootballCope`, replacing the existing files with the same names. Put `publish.yml` under `.github/workflows/` (not the repository root). Keep old `live_week_*.json` files so the Live Win % tab retains prior-week snapshots.
+The GitHub Actions workflow builds `index.html` from `expected_wins.py` and publishes it with the saved `live_week_*.json` snapshots. Keep those snapshot files so the Matchup stats tab retains prior weeks.
 
 In the repository's **Settings > Pages**, set the source to **GitHub Actions**. The workflow publishes on pushes, manual runs, and on a five-minute schedule.
 
@@ -32,4 +49,4 @@ python live_logger.py
 python expected_wins.py
 ```
 
-Open `index.html` in a browser. For trade history, set `ESPN_S2` and `SWID` in the local shell before running.
+Open `index.html` in a browser. For private-league trade history, set `ESPN_S2` and `SWID` in the local shell before running.

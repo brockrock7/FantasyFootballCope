@@ -40,7 +40,7 @@ jobs:
       - name: Collect live scores and probability snapshot
         run: python live_logger.py
 
-      - name: Build the four-tab dashboard
+      - name: Build the dashboard
         run: python expected_wins.py
 
       - name: Save updated live history
