@@ -2,6 +2,8 @@
 
 This ESPN Fantasy dashboard includes:
 
+- **[Dashboard guide](docs/DASHBOARD_GUIDE.md)**: tab-by-tab descriptions, calculation notes, planned features, and player-scoring distribution research.
+
 - **League Stats**: standings sorted by playoff position, playoff markers, power rankings, and a projected playoff/consolation bracket.
 - **Matchup stats**: win-probability history from live snapshots. GitHub Actions collects snapshots every five minutes, and the page checks for fresh data once per minute.
 - **Team Stats**: positional and acquisition breakdowns, starter/bench results, and season-long roster player statistics.
