@@ -4,13 +4,21 @@
 
 `expected_wins.py` is the dashboard source and generates `index.html`. `live_logger.py` writes the `live_week_*.json` history used by Matchup stats. Do not edit generated `index.html` as the durable source.
 
+## Shared controls and navigation
+
+The team acronym buttons beside the league title select that team across all team-selectable charts, including the current matchup containing that team, the power-rank history, and the multiverse views. This changes selections rather than removing other teams' data. Individual chart buttons can still be changed independently.
+
+The URL's versioned `view` query parameter stores the main tab, each subtab, global and local team choices, ranking week, matchup/week, table sorts, pinned chart teams, hidden legend series/slices, opened model details, and a clicked roster distribution. Reloading or sharing the URL restores those choices; native Back/Forward gestures undo and redo intentional selections. Hover and automatic snapshot refreshes do not add history entries. `dashboard_state.js` is embedded into the generated page and is the durable source of this behavior.
+
+The proposed [mobile readability plan](MOBILE_READABILITY_PLAN.md) prioritizes touch navigation, readable scrollable tables, chart labels/legends, and an accessible scoring sheet. It includes phone widths and acceptance checks for a follow-up implementation.
+
 ## Dashboard tabs
 
 ### League Stats
 
 #### Standings
 
-Shows each team's completed regular-season record, playoff position, points for/against, and point differential. ESPN's weekly standings order supplies its tiebreak ordering. When divisions exist, the playoff preview promotes division winners before placing the remaining teams by that standings order.
+Shows each team's completed regular-season record, playoff position, points for/against, and point differential. The sortable Last 3 column, immediately after PCT, shows wins–losses–ties over up to three most recent completed games; it sorts by that recent win percentage. ESPN's weekly standings order supplies its tiebreak ordering. When divisions exist, the playoff preview promotes division winners before placing the remaining teams by that standings order.
 
 For a team with wins $W$, losses $L$, ties $T$, and $G=W+L+T$ completed games:
 
@@ -26,9 +34,9 @@ The playoff position is the projected seed, separate from ESPN rank. The divider
 
 Ranks teams after each completed week and for the current season. The score is a 0–100 weighted sum:
 
-$$\mathrm{Power}=100\left(0.20R+0.10P+0.30R_3+0.20P_3+0.20Q\right)$$
+$$\mathrm{Power}=100\left(0.30R+0.30R_3+0.10P+0.10P_3+0.20Q\right)$$
 
-Here $R$ is overall win percentage, $R_3$ is win percentage over the last three completed games, $P$ is min-max normalized season points, $P_3$ is min-max normalized points over those recent games, and $Q$ is min-max normalized quality rating. The custom quality rating credits wins over above-average scoring opponents, penalizes losses to below-average scoring opponents, and weights each result by the opponent's record entering that week. It is an Elo-style quality measure, not a conventional Elo rating. The chart shows rank history; the table shows the selected week's rank, score, and team color.
+Here $R$ is overall win percentage, $R_3$ is win percentage over the last three completed games, $P$ is min-max normalized season PPG, $P_3$ is min-max normalized PPG over those recent games, and $Q$ is min-max normalized quality rating. Ties count as half a win. The custom quality rating credits wins over above-average scoring opponents, penalizes losses to below-average scoring opponents, and weights each result by the opponent's record entering that week. It is an Elo-style quality measure, not a conventional Elo rating. The chart shows rank history; the table shows the selected week's rank and score, with a colored dot beside the team acronym instead of a separate color column.
 
 #### Playoff Bracket
 
@@ -38,17 +46,15 @@ Projects playoff seeds from the current standings and uses in-progress regular-s
 
 #### Upcoming Matchup
 
-The selected week and matchup control three views together: the two starting lineups and each starter's ESPN projection, overlapping distributions of the projected team totals, and the live win-probability chart. Starter rows with no usable ESPN projection remain visible and count toward the coverage fraction; their missing values are not silently counted as zero. The lineup and projected-total views currently use the current matchup week. Historical week buttons show a note because per-player lineup projections are not archived in the live snapshots yet.
+The matchup buttons appear above the week buttons. These controls update three views together: a single mirrored starting-lineup table, overlapping distributions of projected team totals, and the live win-probability chart. The table pairs players by starting slot, places opposing projections beside each other across a central divider, includes small player photos, shades home/away blue/orange, and totals each side at the bottom. Starter rows with no usable ESPN projection remain visible and count toward the coverage fraction; their missing values are not silently counted as zero. The lineup and projected-total views currently use the current matchup week. Historical week buttons show a note because per-player lineup projections are not archived in the live snapshots yet.
 
-For a team with starter projections $p_i$, the plotted total is $μ_t=\sum_i p_i$. Assuming starter outcomes are independent, the team's approximate variance is the sum of the current per-player projection variances, with $\sigma_i=\max(3,1.7\sqrt{\max(p_i,0)})$; the chart overlays $N(\mu_t,\sum_i\sigma_i^2)$. Dashed lines mark each team's ESPN projected mean. This normal approximation is a visual comparison of the ESPN totals, not a separate scoring model, and missing starter projections make the displayed total partial.
+For a team with starter projections $p_i$, the expected total is $μ_t=\sum_i p_i$. A sum of lognormal variables is generally neither normal nor a single lognormal. The chart therefore shows histogram densities from 10,000 sums of individually simulated starter outcomes rather than imposing a normal team curve. Each player's positive component is lognormal, with an empirical component for observed zero/negative score-to-projection ratios. The mixture is centered on ESPN's projection, uses only completed prior weeks, and falls back to a positive prior without history. Dashed lines mark ESPN projected totals; missing projections make those totals partial. See [the matchup scoring model](MATCHUP_SCORING_MODEL.md) for the formulas, statistical sources, and limitations.
 
 The live win-probability chart uses the same selected matchup. It uses saved score/projection snapshots, gives equal horizontal space to each observation, shades game and high-frequency sampling windows, and retains the recorded observation times on the x-axis. If no snapshots exist yet, the chart is empty while the upcoming lineup and projection comparison remain available.
 
-For each active starter, remaining projected points are estimated as $r_i=\max(0,p_i-s_i)$, where $p_i$ is the ESPN projection and $s_i$ is current points. A player's remaining-score standard deviation is approximated as:
+For each unfinished starter, remaining mean points are $r_i=\max(0,p_i-s_i)$, where $p_i$ is the ESPN projection and $s_i$ is current points. If the player has exceeded projection during an active game, the fallback mean is $\max(p_i,s_i,0)(1-g_i)$, preserving remaining upside. The positive lognormal shape uses past positive score/projection ratios when available; otherwise its prior SD is $\max(3\sqrt{1-g_i},1.7\sqrt{\max(r_i,\max(p_i,s_i,0)(1-g_i))})$. Here $g_i$ is game progress, estimated from kickoff over a three-hour window when ESPN reports only 0 or 100. Observed nonpositive ratios are scaled by unplayed fraction and are the only source of negative simulated remaining points. Bench, IR, and finished players have no future draws.
 
-$$\sigma_i=\max\left(3,\;1.7\sqrt{\max\left(r_i,\max(p_i,s_i,0)(1-g_i)\right)}\right)$$
-
-where $g_i$ is the reported fraction of the player's game completed. Bench and injured-reserve players are excluded. Team means add the remaining projections; team variances add the player variances. The dashboard samples 5,000 normally distributed final margins and reports the percentage of samples won by the home team. This is a practical approximation based on ESPN projections, not a calibrated player-outcome model.
+The logger samples 5,000 individual-player remaining-score totals, adds current team scores, and reports home wins with ties counted as half. The independent-player assumption does not model teammate/opponent correlations; these estimates still need calibration. During scheduled or active NFL game windows the logger targets one observation per ten-minute bucket. The five-minute workflow is offset from the top of the hour, but GitHub Actions can delay or drop scheduled jobs, so exact ten-minute delivery is not guaranteed. Existing archived probabilities remain unchanged.
 
 ### Team Stats
 
@@ -68,7 +74,7 @@ Compares actual lineup points with bench points and the best lineup that could h
 
 $$\mathrm{LeftOnBench}_w=\max(0,\mathrm{Optimal}_w-\mathrm{Actual}_w)$$
 
-The summary table reports season totals and per-game averages. The weekly chart compares starter and bench totals; the points-left chart shows each week's value as a dot, the team mean ± one sample standard deviation as a candle, and the weekly minimum/maximum as whiskers. Color moves from green for lower average points left to red for higher average points left.
+The summary table reports season totals, per-game averages, and realization of the optimal lineup. The charts compare actual versus optimal lineup points and starter versus bench totals across teams. The candle/distribution chart has been removed; points left on the bench still inform the optimal-lineup calculations and leaderboard.
 
 #### Win/Loss Differential
 
@@ -78,9 +84,9 @@ $$d_w=\mathrm{PF}_w-\mathrm{PA}_w$$
 
 #### Rosters
 
-Shows each selected team's current roster, including players currently on that roster whose earlier scoring weeks were spent on other fantasy teams. Bye weeks are excluded. Season PPG is the mean of a player's completed weekly scores; `Points vs. Initial Projections (PPG)` is the mean of actual points minus the initial ESPN projection across weeks with a usable projection. `Projection SD` is the modelled standard deviation of weekly actual-minus-ESPN-projection points, using every available completed week with both an actual and positive ESPN projection. A player-specific lognormal fit is used with at least two positive score/projection ratios; shorter histories use a pooled same-position prior, then a league-wide prior, when at least one usable player-week exists. The value remains blank when even those data are unavailable.
+Shows each selected team's current roster, including players currently on that roster whose earlier scoring weeks were spent on other fantasy teams. Bye weeks are excluded. Season PPG is the mean of a player's completed weekly scores; $\overline{\Delta}$ vs. Projections (PPG) is the mean of actual points minus the initial ESPN projection across weeks with a usable projection. `SD vs. Projections` is the modelled standard deviation of weekly actual-minus-ESPN-projection points, using every available completed week with both an actual and positive ESPN projection. A player-specific lognormal fit is used with at least two positive score/projection ratios; shorter histories use a pooled same-position prior, then a league-wide prior, when at least one usable player-week exists. The value remains blank when even those data are unavailable.
 
-Hovering, focusing, or clicking a Projection SD value opens the weekly scoring distribution. For each eligible week, the model forms the ratio $R_i=S_i/P_i$, where $S_i$ is actual fantasy score and $P_i$ is that week's ESPN projection. Positive ratios are fitted as $\log(R)\sim N(\mu,\sigma^2)$; observed zero and negative ratios are retained as an empirical component, because a lognormal curve cannot represent them. The mixture is $R\sim q\,\mathrm{Lognormal}(\mu,\sigma^2)+(1-q)F_{\leq0}$, where $q$ is the observed share of positive ratios and $F_{\leq0}$ is the empirical distribution of nonpositive ratios. The hover graph scales the ratio model by the selected ESPN projection, shows the positive lognormal density, plots all weekly actual scores as yellow dots, and marks the modelled mean and mean $\pm1$ SD with dashed lines. The displayed Projection SD is calculated from this projection-scaled mixture across the player's historical ESPN projections, not from the raw sample SD of fantasy points. Specifically, for empirical projections $P$ and a ratio $R$ assumed independent of $P$, $\mathrm{SD}(S-P)=\sqrt{\mathbb{E}[P^2]\mathbb{E}[(R-1)^2]-\{\mathbb{E}[P]\mathbb{E}[R-1]\}^2}$. When individual history is short, the lognormal shape comes from a same-position pool, then a league-wide pool, while the player's own historical projections scale the error SD. D/ST players use NFL team logos when a team logo can be identified.
+Hovering, focusing, or clicking an SD vs. Projections value opens the weekly scoring distribution. For each eligible week, the model forms the ratio $R_i=S_i/P_i$, where $S_i$ is actual fantasy score and $P_i$ is that week's ESPN projection. Positive ratios are fitted as $\log(R)\sim N(\mu,\sigma^2)$; observed zero and negative ratios are retained as an empirical component, because a lognormal curve cannot represent them. The mixture is $R\sim q\,\mathrm{Lognormal}(\mu,\sigma^2)+(1-q)F_{\leq0}$, where $q$ is the observed share of positive ratios and $F_{\leq0}$ is the empirical distribution of nonpositive ratios. The hover graph scales the ratio model by the selected ESPN projection, shows the positive lognormal density, plots all weekly actual scores as yellow dots, and marks the model mean and ESPN projection with dashed lines. Only weekly scores, ESPN projection, and model mean appear in the legend; the distribution is omitted. Its horizontal range is 0–50, expanding only to include observed negative or above-50 weekly scores. The displayed SD vs. Projections is calculated from this projection-scaled mixture across the player's historical ESPN projections, not from the raw sample SD of fantasy points. Specifically, for empirical projections $P$ and a ratio $R$ assumed independent of $P$, $\mathrm{SD}(S-P)=\sqrt{\mathbb{E}[P^2]\mathbb{E}[(R-1)^2]-\{\mathbb{E}[P]\mathbb{E}[R-1]\}^2}$. When individual history is short, the lognormal shape comes from a same-position pool, then a league-wide pool, while the player's own historical projections scale the error SD. D/ST players use NFL team logos when a team logo can be identified.
 
 ### Luck Stats
 
@@ -108,7 +114,7 @@ An above-average opponent win earns $\max(z_w,0)q_w$; a loss to a below-average 
 
 Keeps each team's actual weekly score fixed and samples 20,000 valid round-robin schedules. Each simulated schedule has every opponent once, then repeats the same early-round opponents to fill the regular season. Matchups are re-drawn for each simulation. It applies the league's division and configured tiebreak rules, then records wins, standings, and first-place outcomes; completed postseason scores can also be used to estimate playoff advancement and title frequencies.
 
-The charts show a selected team's wins distribution, distributions for all teams, the actual schedule result and percentile, and each team's share of first-place finishes or simulated titles. These are schedule-variance simulations, not projections of future player scores.
+The charts show a selected team's wins distribution, distributions for all teams, the actual schedule result and percentile, and each team's share of first-place finishes or simulated titles. The selected team's pie slice is offset with a brighter border while other slices are dimmed. These are schedule-variance simulations, not projections of future player scores.
 
 ### Trades
 
@@ -116,7 +122,7 @@ Shows completed accepted trades by team. For each trade, player points are count
 
 $$\mathrm{NetPoints}=\mathrm{IncomingPoints}-\mathrm{OutgoingPoints},\qquad \mathrm{PointsPerWeek}=\frac{\mathrm{NetPoints}}{\mathrm{CompletedWeeksAfterTrade}}$$
 
-The view shows a cumulative received-minus-sent chart, per-trade incoming/outgoing players and weekly points, and a team rating. Rating cutoffs are heuristic: at least +5 points/week is “GM of the Year,” at least +1 “Won the Trade,” above −1 “Even Trade,” above −5 “Lost the Trade,” and −5 or below “Fleeced.” ESPN may restrict trade history; complete records can require `ESPN_S2` and `SWID` repository secrets.
+The cumulative chart has separate raw received-minus-sent and starter-only received-minus-sent lines. Starter-only points count a player only in weeks actually started by the fantasy team that received that player in the trade; bench weeks and later owners do not count. Outgoing starter points are measured for their receiving team and subtracted. Missing historical ownership never invents a start. Per-trade charts show one line per player, with larger points for recipient-team starts, and sent/received photos both have blue outlines. The team rating continues to use raw net points. Rating cutoffs are heuristic: at least +5 points/week is “GM of the Year,” at least +1 “Won the Trade,” above −1 “Even Trade,” above −5 “Lost the Trade,” and −5 or below “Fleeced.” ESPN may restrict trade history; complete records can require `ESPN_S2` and `SWID` repository secrets.
 
 ### Leaderboard
 

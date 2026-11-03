@@ -5,14 +5,16 @@ This ESPN Fantasy dashboard includes:
 - **[Dashboard guide](docs/DASHBOARD_GUIDE.md)**: tab-by-tab descriptions, calculation notes, planned features, and player-scoring distribution research.
 
 - **League Stats**: standings sorted by playoff position, playoff markers, power rankings, and a projected playoff/consolation bracket.
-- **Matchup stats**: win-probability history from live snapshots. GitHub Actions collects snapshots every five minutes, and the page checks for fresh data once per minute.
+- **Matchup stats**: mirrored starter projections, simulated team-score distributions, and win-probability history. The logger targets ten-minute observations during NFL games; GitHub Actions runs every five minutes but may delay scheduled runs. The page checks for fresh data once per minute.
 - **Team Stats**: positional and acquisition breakdowns, starter/bench results, and season-long roster player statistics.
 - **Luck Stats**: expected wins, schedule luck, and simulated schedule outcomes.
 - **Trades** and **Leaderboard**: completed trade records, trade impact, and season leaders.
 
 Roster averages and standard deviations use a player's completed scoring weeks across all fantasy teams and exclude NFL bye weeks. D/ST rows use NFL team logos when ESPN provides a recognizable team name or abbreviation.
 
-The live probability and trade calculator are estimates. Win probability uses a simulation of remaining ESPN projections. The trade calculator compares projected remaining season points. Trade impact counts players' actual fantasy points in scoring weeks after the trade week.
+The global team buttons select a team across charts. Selections, tabs, sorts, and chart legend visibility are stored in the URL and support native Back/Forward. See the [mobile readability plan](docs/MOBILE_READABILITY_PLAN.md) for proposed phone improvements.
+
+Live win probability uses individual positive lognormal outcomes plus observed nonpositive history, centered on remaining ESPN projections. See the [matchup scoring model](docs/MATCHUP_SCORING_MODEL.md) for assumptions and limitations. Trade impact compares raw and recipient-started player points in scoring weeks after the trade week.
 
 ## League-format portability
 

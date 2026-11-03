@@ -5,7 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    # Offset from the busiest top-of-hour slots; the collector records one
+    # observation per ten-minute game-time bucket.
+    - cron: "3-58/5 * * * *"
 
 permissions:
   contents: write
