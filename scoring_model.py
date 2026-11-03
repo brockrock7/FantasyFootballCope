@@ -113,3 +113,21 @@ def score_density(samples, bins=100):
         counts[index] += 1
     return [{"x": round(low + (index + .5) * width, 3),
              "y": count / (len(samples) * width)} for index, count in enumerate(counts)]
+
+
+def central_score_interval(samples, coverage=.95):
+    """Equal-tail interval from draws, independent of histogram bin heights."""
+    if not 0 < coverage < 1:
+        raise ValueError("coverage must be between zero and one")
+    if not samples:
+        return None
+    ordered = sorted(samples)
+
+    def quantile(probability):
+        index = (len(ordered) - 1) * probability
+        low = math.floor(index)
+        high = math.ceil(index)
+        return ordered[low] + (ordered[high] - ordered[low]) * (index - low)
+
+    tail = (1 - coverage) / 2
+    return [quantile(tail), quantile(1 - tail)]

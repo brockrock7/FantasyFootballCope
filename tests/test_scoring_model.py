@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import math
 from pathlib import Path
 import random
@@ -8,7 +9,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from scoring_model import player_progress, player_score_model, sample_player_score, sample_team_scores, score_density, merge_scoring_history
+from scoring_model import player_progress, player_score_model, sample_player_score, sample_team_scores, score_density, merge_scoring_history, central_score_interval
 
 
 def load_logger():
@@ -24,6 +25,31 @@ def load_logger():
 
 
 class ScoreModelTests(unittest.TestCase):
+    def test_central_interval_uses_probability_quantiles_without_mutating_draws(self):
+        samples = list(reversed(range(101)))
+        original = samples.copy()
+        lower, upper = central_score_interval(samples)
+        self.assertAlmostEqual(lower, 2.5)
+        self.assertAlmostEqual(upper, 97.5)
+        self.assertEqual(samples, original)
+        # A low-height tail can still contain enough probability to enter the
+        # central interval; histogram peak height is not a quantile criterion.
+        skewed = [0] * 9600 + [10] * 400
+        self.assertEqual(central_score_interval(skewed), [0, 10])
+        self.assertIsNone(central_score_interval([]))
+        self.assertEqual(central_score_interval([12]), [12, 12])
+        with self.assertRaises(ValueError):
+            central_score_interval(samples, coverage=1)
+
+    def test_configured_lineup_slots_use_familiar_order_and_keep_custom_slots(self):
+        source = Path(__file__).parents[1] / "expected_wins.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_matchup_lineup_slot_order")
+        scope = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+        settings = SimpleNamespace(position_slot_counts={"D/ST": 1, "K": 1, "WR": 2, "RB/WR/TE": 1, "QB": 1, "RB": 2, "TE": 1, "BE": 6, "IR": 2, "CUSTOM": 1})
+        self.assertEqual(scope["_matchup_lineup_slot_order"](settings), ["QB", "RB", "WR", "TE", "FLEX", "K", "D/ST", "CUSTOM"])
+
     def test_partial_box_rows_preserve_card_projection_and_normalize_week_keys(self):
         history = merge_scoring_history(
             {1: {"points": 10, "projected_points": 12}},

@@ -17,7 +17,7 @@ const server=http.createServer((request,response)=>{
   const browser=await chromium.launch({headless:true,...(process.env.BROWSER_CHANNEL?{channel:process.env.BROWSER_CHANNEL}:{})});
   try{
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
-    page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
+    page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.stack||error.message);});
     page.on('requestfailed',request=>{if(request.url().includes('chart.umd'))console.error('Chart request failed:',request.failure());});
     await page.goto(`http://127.0.0.1:${server.address().port}`,{waitUntil:'networkidle'});
     await page.waitForFunction(()=>new URL(location.href).searchParams.has('view'));
@@ -95,7 +95,41 @@ const server=http.createServer((request,response)=>{
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'no page overflow at '+width+'px');
     }
     if(process.env.DASHBOARD_SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.DASHBOARD_SCREENSHOT_DIR,'matchup-mobile.png'),fullPage:true});
+    // A real touch context exercises the pinned mobile distribution sheet.
+    const touchPage=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
+    try{
+      touchPage.on('pageerror',error=>{errors.push(error.message);console.error('Touch browser error:',error.stack||error.message);});
+      await touchPage.goto(`http://127.0.0.1:${server.address().port}`,{waitUntil:'networkidle'});
+      await touchPage.waitForFunction(()=>new URL(location.href).searchParams.has('view'));
+      await touchPage.locator('[data-tab="team"]').tap();
+      await touchPage.locator('[data-team-view="roster"]').tap();
+      const trigger=touchPage.locator('.sd-trigger').first();
+      await trigger.tap();
+      await touchPage.waitForFunction(()=>rosterSdPopover.classList.contains('active')&&rosterSdPinned);
+      const geometry=await touchPage.evaluate(()=>{const rect=rosterSdPopover.getBoundingClientRect(),close=rosterSdClose.getBoundingClientRect();return{left:rect.left,right:rect.right,top:rect.top,bottom:rect.bottom,width:innerWidth,height:innerHeight,closeHeight:close.height,closeWidth:close.width,overflow:document.documentElement.scrollWidth>innerWidth,locked:getComputedStyle(document.body).overflow==='hidden',focused:document.activeElement===rosterSdClose,modal:rosterSdPopover.getAttribute('aria-modal')};});
+      assert(geometry.left>=0&&geometry.right<=geometry.width+1&&geometry.top>=0&&geometry.bottom<=geometry.height+1,'sheet stays inside viewport');
+      assert(Math.abs(geometry.bottom-geometry.height)<2,'mobile sheet is anchored to bottom');
+      assert(geometry.closeHeight>=44&&geometry.closeWidth>=44,'Close is a touch target');
+      assert(!geometry.overflow&&geometry.locked&&geometry.focused);assert.equal(geometry.modal,'true');
+      await touchPage.keyboard.press('Shift+Tab');
+      assert.equal(await touchPage.evaluate(()=>rosterSdPopover.contains(document.activeElement)),true,'focus stays inside sheet');
+      await touchPage.keyboard.press('Tab');
+      assert.equal(await touchPage.evaluate(()=>document.activeElement===rosterSdClose),true,'Tab wraps to Close');
+      await touchPage.locator('.sd-popover').dispatchEvent('mouseleave');
+      await touchPage.waitForTimeout(250);
+      assert.equal(await touchPage.locator('.sd-popover.active').count(),1,'explicitly opened sheet stays open after mouseleave');
+      await touchPage.locator('#rosterSdClose').tap();
+      await touchPage.waitForFunction(()=>!rosterSdPopover.classList.contains('active')&&!dashboardState().distribution);
+      assert.equal(await touchPage.evaluate(()=>document.activeElement?.classList.contains('sd-trigger')),true,'Close returns focus to player');
+      await trigger.tap();await touchPage.keyboard.press('Escape');
+      await touchPage.waitForFunction(()=>!rosterSdPopover.classList.contains('active')&&!document.body.classList.contains('sd-modal-open'));
+      await trigger.tap();
+      if(process.env.DASHBOARD_SCREENSHOT_DIR)await touchPage.screenshot({path:path.join(process.env.DASHBOARD_SCREENSHOT_DIR,'roster-sheet-mobile.png')});
+      await touchPage.locator('.sd-backdrop').tap({position:{x:8,y:8}});
+      await touchPage.waitForFunction(()=>!rosterSdPopover.classList.contains('active'));
+    }finally{await touchPage.close();}
+    await require('./mobile_layout.cjs')(page);
     assert.deepEqual(errors,[]);
-    console.log('PASS: global/local selection, native history, real legend clicks, sorts, roster popout, pie highlight, matchup, reload, and 320/390/430px layout');
+    console.log('PASS: global/local selection, native history, real legend clicks, sorts, roster popout, pie highlight, matchup, reload, 320/390/430px layout, and touch distribution sheet');
   }finally{await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>server.close());
