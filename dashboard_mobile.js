@@ -23,6 +23,13 @@ function sizeHorizontalChart(chart){
   host.style.setProperty('--bar-chart-height',Math.max(300,count*rowHeight+(phoneLayout.matches?60:85))+'px');
 }
 function applyMobileChartLayout(chart){
+  const labels=chart.options.plugins.legend.labels;
+  if(!chart.$segmentLegend){
+    const generate=labels.generateLabels,filter=labels.filter;
+    labels.generateLabels=function(chart){return generate.call(this,chart).filter(item=>item.text!=='0 points'&&(!filter||filter(item,chart.data))).map(item=>({...item,pointStyle:'line',lineWidth:2,strokeStyle:typeof item.fillStyle==='string'&&chart.config.type!=='line'?item.fillStyle:item.strokeStyle}));};
+    labels.filter=undefined;labels.usePointStyle=true;labels.pointStyleWidth=24;labels.boxWidth=24;
+    chart.$segmentLegend=true;
+  }
   rememberChartLayout(chart);
   const saved=chart.$desktopLayout,phone=phoneLayout.matches;
   chart.options.plugins.legend.display=phone?false:saved.legend;

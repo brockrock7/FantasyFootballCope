@@ -89,3 +89,16 @@ check('randomized exact assignment matches an exhaustive legal-lineup oracle',()
   }
 });
 console.log(checks+' trade calculator checks passed.');
+
+check('vacant slots use distinct available free agents and respect their byes',()=>{
+ const {withReplacements,tradeRating}=require('../trade_calculator.js');
+ const fa=[player(90,'RB',12,{free_agent:true,bye_week:2}),player(91,'RB',8,{free_agent:true})];
+ const before=withReplacements([],['RB','RB'],1,fa);
+ assert.equal(before.total,20);assert.equal(new Set(before.lineup.map(x=>x.player.id)).size,2);
+ assert.equal(withReplacements([],['RB','RB'],2,fa).total,8);
+ assert.equal(withReplacements([player(1,'RB',5)],['RB'],1,fa).total,5);
+ const fixture=data([], [player(2,'RB',20)],['RB']);fixture.free_agents=fa;
+ assert.equal(evaluateTrade(fixture,state({sendB:['2']})).a.delta,20); // (20-12)+(20-8)
+ assert.equal(tradeRating(10,12,2),'Mutually beneficial');assert.equal(tradeRating(-10,-12,2),'Mutually detrimental');
+ assert.equal(tradeRating(10,-12,2),'One-sided');assert.equal(tradeRating(.5,-.5,2),'Even');
+});

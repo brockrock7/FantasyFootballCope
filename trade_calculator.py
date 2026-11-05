@@ -6,6 +6,7 @@ forecasts, not future ownership. The browser optimizes lineups using these rows.
 from __future__ import annotations
 
 import math
+import json
 from collections import Counter
 
 
@@ -165,6 +166,35 @@ def player_forecasts(player, roster_row, weeks, current_week, projections):
     }
 
 
+def free_agent_forecasts(league, weeks, current_week):
+    """Page through currently available (not waiver-locked) players for each week."""
+    from espn_api.football.player import Player
+    pool, forecasts = {}, {}
+    schedule = league._get_all_pro_schedule()
+    owned = {getattr(p, "playerId", None) for t in league.teams for p in t.roster}
+    for week in weeks:
+        offset = 0
+        while True:
+            filters = {"players": {"filterStatus": {"value": ["FREEAGENT"]},
+                       "limit": 1000, "offset": offset,
+                       "sortPercOwned": {"sortPriority": 1, "sortAsc": False}}}
+            response = league.espn_request.league_get(
+                params={"view": "kona_player_info", "scoringPeriodId": week},
+                headers={"x-fantasy-filter": json.dumps(filters)})
+            entries = response.get("players", [])
+            forecasts.update(raw_weekly_projections({"teams": [{"roster": {"entries": entries}}]}, league.year, week))
+            for entry in entries:
+                pid = (entry.get("player") or {}).get("id")
+                if pid is not None and pid not in owned and pid not in pool:
+                    pool[pid] = Player(entry, league.year, schedule)
+            offset += len(entries)
+            if len(entries) < 1000:
+                break
+    result = [dict(player_forecasts(player, {}, weeks, current_week, forecasts), free_agent=True)
+              for player in pool.values()]
+    return [p for p in result if p["nfl_team"] not in ("", "None", "FA") and any((row.get("points") or 0) > 0 for row in p["projections"].values())]
+
+
 def build_trade_calculator(league, current_rosters, schedule_meta):
     """Fetch each remaining league week once and retain forecast provenance."""
     current_week = max(1, _integer(getattr(league, "current_week", 1), 1))
@@ -196,13 +226,23 @@ def build_trade_calculator(league, current_rosters, schedule_meta):
         for player in players:
             sources.update(row["source"] for row in player["projections"].values())
         teams[team_id] = {"id": team_id, "name": str(team.team_name), "players": players}
+    free_agents = []
+    free_agent_error = ""
+    try:
+        free_agents = free_agent_forecasts(league, weeks, current_week)
+    except Exception as exc:
+        free_agent_error = "Free-agent projections unavailable; replacement comparisons are incomplete."
+        print(f"Trade calculator free-agent fetch failed: {exc}")
     notes = [
         "Each side is valued by its best legal projected starting lineup in each remaining league week, including fantasy playoffs.",
         "Weekly ESPN projections are used where published. Missing weeks use ESPN projected PPG, then recent ESPN projections, then historical PPG; missing values remain unknown.",
         "NFL byes score zero. Current-week OUT/IR players are unavailable; future forecasts for injured players are conditional on returning, with no invented recovery date.",
-        "This is a full-week hypothetical. Already-played games, lineup locks, trade processing, roster limits, waiver replacements, and playoff qualification are not simulated.",
+        "This is a full-week hypothetical. Already-played games, lineup locks, trade processing, roster limits, and playoff qualification are not simulated.",
     ]
+    notes.append("Empty starter slots use the best projected currently available free agent, independently for each team and week. Waiver-locked players are excluded; availability may change. Occupied roster slots are retained.")
+    if free_agent_error:
+        notes.append(free_agent_error)
     if failed_weeks:
         notes.append("ESPN weekly forecast requests failed for week(s) " + ", ".join(map(str, failed_weeks)) + "; labeled baselines are used where available.")
     return {"weeks": weeks, "current_week": current_week, "lineup_slots": slots, "teams": teams,
-            "notes": notes, "projection_coverage": dict(sources), "failed_weeks": failed_weeks}
+            "free_agents": free_agents, "free_agent_error": free_agent_error, "notes": notes, "projection_coverage": dict(sources), "failed_weeks": failed_weeks}

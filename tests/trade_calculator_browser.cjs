@@ -66,7 +66,10 @@ module.exports=async function verifyTradeCalculator(page){
   await page.locator('[data-trades-view="history"]').click();
   const history=await page.evaluate(()=>({raw:teamTradeChart.data.datasets[0].borderDash,started:teamTradeChart.data.datasets[1].borderDash,
     outlines:[...document.querySelectorAll('.trade-sent img,.trade-sent .roster-photo')].map(node=>getComputedStyle(node).borderColor),
-    circles:[...individualTradeCharts].flatMap(chart=>chart.data.datasets.map(dataset=>({radius:dataset.pointRadius,colors:dataset.pointBackgroundColor})))}));
+    circles:[...individualTradeCharts].flatMap(chart=>chart.data.datasets.filter(dataset=>!dataset.hideFromLegend).map(dataset=>({radius:dataset.pointRadius,colors:dataset.pointBackgroundColor})))}));
+  const legends=await page.evaluate(()=>Object.values(Chart.instances).flatMap(chart=>(chart.legend?.legendItems||[]).map(item=>({text:item.text,style:item.pointStyle}))));
+  assert(legends.every(item=>item.text!=='0 points'&&item.style==='line'),'all legend keys are segments without zero reference');
+  assert.equal(await page.evaluate(()=>[...individualTradeCharts].every(chart=>chart.data.datasets.some(dataset=>dataset.fill?.above==='rgba(63,185,80,.18)'))),true,'trade green/red regions');
   assert(history.raw.length>0);assert.equal(history.started.length,0);
   assert(history.outlines.every(color=>color==='rgb(245, 166, 35)'),'sent photos orange');
   history.circles.forEach(dataset=>{assert(dataset.radius>=6);assert(Array.isArray(dataset.colors));});
