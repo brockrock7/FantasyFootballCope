@@ -40,11 +40,11 @@ function tableSorts(){
   });return result;
 }
 function dashboardState(){
-  const sub={};['league','team','luck'].forEach(group=>{sub[group]=document.querySelector('.'+group+'-subtab.active')?.dataset[group+'View'];});
+  const sub={};['league','team','luck','trades'].forEach(group=>{sub[group]=document.querySelector('.'+group+'-subtab.active')?.dataset[group+'View'];});
   return {v:dashboardViewVersion,tab:document.querySelector('.tab.active')?.dataset.tab,sub,globalTeam,
     buttons:selectedButtons(),live:{week:selectedLiveWeek,matchup:selectedLiveMatchup},sorts:tableSorts(),
     pins:{power:pinnedPowerTeam===null?null:D.teams[pinnedPowerTeam],multiverse:pinnedMultiverseIndex===null?null:D.teams[pinnedMultiverseIndex]},
-    charts:captureChartPreferences(),distribution:clickedDistribution,
+    charts:captureChartPreferences(),distribution:clickedDistribution,trade:tradeCalculator.getState(),
     details:[...document.querySelectorAll('details')].map((detail,index)=>detail.open?index:null).filter(index=>index!==null)};
 }
 function saveDashboardState(replace=false){
@@ -74,6 +74,7 @@ function chooseGlobalTeam(team){
   if(!D.teams.includes(team))return;
   markGlobalTeam(team);
   teamControls.forEach(control=>control.choose(team));
+  tradeCalculator.selectTeam(team);
   showMultiverseTeam(team);
   pinnedPowerTeam=D.teams.indexOf(team);highlightPowerTeam(pinnedPowerTeam);
   pinnedMultiverseIndex=D.teams.indexOf(team);highlightMultiverseLine(pinnedMultiverseIndex);
@@ -103,13 +104,14 @@ async function restoreDashboardState(state){
     hideRosterDistribution();clickedDistribution='';
     markGlobalTeam(state.globalTeam);
     if(state.tab)document.querySelector(`.tab[data-tab="${CSS.escape(state.tab)}"]`)?.click();
-    ['league','team','luck'].forEach(group=>{
+    ['league','team','luck','trades'].forEach(group=>{
       const view=state.sub?.[group];
       if(typeof view==='string')document.querySelector(`.${group}-subtab[data-${group}-view="${CSS.escape(view)}"]`)?.click();
     });
     Object.entries(state.buttons||{}).forEach(([host,title])=>{
       if(!['globalTeams','liveWeeks','liveMatchups'].includes(host)&&typeof title==='string')chooseButton(host,title);
     });
+    tradeCalculator.setState(state.trade||initialDashboardState.trade,{silent:true});
     const week=String(state.live?.week||'');
     if([...liveWeeksHost.children].some(button=>button.textContent==='W'+week)){
       selectedLiveWeek=week;

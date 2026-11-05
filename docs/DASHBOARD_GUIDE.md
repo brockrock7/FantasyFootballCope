@@ -6,13 +6,15 @@
 
 ## Shared controls and navigation
 
-The team acronym buttons beside the league title select that team across all team-selectable charts, including the current matchup containing that team, the power-rank history, and the multiverse views. This changes selections rather than removing other teams' data. Individual chart buttons can still be changed independently.
+The team acronym buttons beside the league title select that team across all team-selectable charts, including the current matchup containing that team, the power-rank history, the multiverse views, and the Trade Calculator’s own-team roster. This changes selections rather than removing other teams' data. Individual chart buttons can still be changed independently.
 
-The URL's versioned `view` query parameter stores the main tab, each subtab, global and local team choices, ranking week, matchup/week, table sorts, pinned chart teams, hidden legend series/slices, opened model details, and a clicked roster distribution. Reloading or sharing the URL restores those choices; native Back/Forward gestures undo and redo intentional selections. Hover and automatic snapshot refreshes do not add history entries. `dashboard_state.js` is embedded into the generated page and is the durable source of this behavior.
+The URL's versioned `view` query parameter stores the main tab, each subtab, global and local team choices, ranking week, matchup/week, table sorts, pinned chart teams, hidden legend series/slices, opened model details, a clicked roster distribution, and the Trade Calculator’s teams, selected players, and week range. Reloading or sharing the URL restores those choices; native Back/Forward gestures undo and redo intentional selections. Hover and automatic snapshot refreshes do not add history entries. `dashboard_state.js` is embedded into the generated page and is the durable source of this behavior.
 
 All tables size columns to their content rather than fixed widths or stretched equal columns. Long headings wrap, numeric values remain visible, and PPG is shown beneath totals. On phones, standings use team acronyms with accessible full names, wide tables scroll internally with a scroll hint and sticky team/player identity column, and roster photos/names use a compact layout.
 
-At widths up to 700px, navigation tabs and the global team strip scroll horizontally with 44px touch targets. Team-wide position, acquisition, actual/optimal, and starter/bench comparisons become horizontal bar charts. Mobile charts use wrapping HTML legend buttons that preserve URL-backed visibility; weekly charts retain readable heights and fewer date ticks. Cards, trade layouts, radars, and leaderboard badges adapt to the available width. Reduced-motion settings disable chart animation. `dashboard_mobile.css` and `dashboard_mobile.js` are embedded into the generated page. The [mobile readability plan and implementation status](MOBILE_READABILITY_PLAN.md) records remaining refinements and verification limits.
+The restyled dashboard preserves the dark palette, team/series colors, and system font. Primary navigation stays visible while scrolling; rounded subtabs separate related views. At widths up to 700px, navigation and team selectors scroll horizontally with 44px touch targets. Every bar chart is horizontal at every screen width, including weekly position/source stacks, win/loss differentials, schedule luck, and multiverse distributions; chart height grows with the number of rows. Selected-team weekly breakdowns appear before league comparisons, and phone radar cards form a swipeable strip. Mobile charts use wrapping HTML legend buttons that preserve URL-backed visibility and distinguish dashed lines. Tables remain content-sized inside scroll regions. Cards, trade layouts, and leaderboard badges adapt to the available width. Reduced-motion settings disable chart animation. `dashboard_mobile.css` and `dashboard_mobile.js` are embedded into the generated page. The [mobile readability plan and implementation status](MOBILE_READABILITY_PLAN.md) records remaining refinements and verification limits.
+
+The [pre-redesign backup](DASHBOARD_BACKUP.md) preserves the previous source, generated page, and guide on a separate Git branch, with a local ZIP as well.
 
 ## Dashboard tabs
 
@@ -82,7 +84,7 @@ The summary table reports season totals, per-game averages, and realization of t
 
 #### Win/Loss Differential
 
-Shows weekly points scored minus points allowed, centered at zero and colored by matchup result. The summary chart reports the average absolute differential in wins above zero and the negative average absolute differential in losses below zero.
+Shows weekly points scored minus points allowed, centered at zero and colored by matchup result. The summary chart reports the average absolute differential in wins to the right of zero and the negative average absolute differential in losses to the left of zero.
 
 $$d_w=\mathrm{PF}_w-\mathrm{PA}_w$$
 
@@ -124,11 +126,31 @@ The charts show a selected team's wins distribution, distributions for all teams
 
 ### Trades
 
+#### Trade History
+
 Shows completed accepted trades by team. For each trade, player points are counted from the week after the trade through the last completed scoring week. The team's trade yield is:
 
 $$\mathrm{NetPoints}=\mathrm{IncomingPoints}-\mathrm{OutgoingPoints},\qquad \mathrm{PointsPerWeek}=\frac{\mathrm{NetPoints}}{\mathrm{CompletedWeeksAfterTrade}}$$
 
-The cumulative chart has separate raw received-minus-sent and starter-only received-minus-sent lines. Starter-only points count a player only in weeks actually started by the fantasy team that received that player in the trade; bench weeks and later owners do not count. Outgoing starter points are measured for their receiving team and subtracted. Missing historical ownership never invents a start. Per-trade charts show one line per player, with larger points for recipient-team starts, and sent/received photos both have blue outlines. The team rating continues to use raw net points. Rating cutoffs are heuristic: at least +5 points/week is “GM of the Year,” at least +1 “Won the Trade,” above −1 “Even Trade,” above −5 “Lost the Trade,” and −5 or below “Fleeced.” ESPN may restrict trade history; complete records can require `ESPN_S2` and `SWID` repository secrets.
+The cumulative chart uses a dashed raw received-minus-sent line and a solid, thicker starter-only received-minus-sent line. Starter-only points count a player only in weeks actually started by the fantasy team that received that player in the trade; bench weeks and later owners do not count. Outgoing starter points are measured for their receiving team and subtracted. Missing historical ownership never invents a start. Per-trade charts show one line per player with equally large weekly circles: filled for recipient-team starts, hollow for other weeks. Sent-player photos have orange outlines; received-player photos have blue outlines. The team rating continues to use raw net points. Rating cutoffs are heuristic: at least +5 points/week is “GM of the Year,” at least +1 “Won the Trade,” above −1 “Even Trade,” above −5 “Lost the Trade,” and −5 or below “Fleeced.” ESPN may restrict trade history; complete records can require `ESPN_S2` and `SWID` repository secrets.
+
+#### Trade Calculator
+
+Select your team and a partner, then tap players in the two side-by-side rosters to construct a hypothetical trade. Selected outgoing players use orange accents; incoming players use blue. The roster columns remain side by side on phones, with compact player details and internal scrolling. Results update immediately, and team/player/week selections are shareable through the URL and native Back/Forward.
+
+The calculator uses remaining-week ESPN projections and the league's configured starter slots and player eligibility. Each week is optimized independently, before and after exchanging the selected players. A player may fill at most one eligible slot; repeated RB/WR slots, FLEX, and superflex compete for the same players. Byes and known current-week absences contribute zero. Empty slots contribute zero and are disclosed. Bench depth adds projected lineup points only when it improves an actual starting slot in one of the evaluated weeks.
+
+For roster $R$, week $w$, starter slots $S$, and projection $p_{i,w}$, the optimizer solves a maximum-weight assignment:
+
+$$V(R,w)=\max_x\sum_{i\in R}\sum_{s\in S}p_{i,w}x_{i,s},\quad\sum_s x_{i,s}\leq1,\quad\sum_i x_{i,s}\leq1,\quad x_{i,s}=0\text{ if player }i\text{ is ineligible for slot }s.$$
+
+For sent players $A$, received players $B$, and selected remaining weeks $W$, your gain is:
+
+$$\Delta_w=V((R\setminus A)\cup B,w)-V(R,w),\qquad\Delta_{\mathrm{total}}=\sum_{w\in W}\Delta_w,\qquad\Delta_{\mathrm{per\ week}}=\frac{\Delta_{\mathrm{total}}}{|W|}.$$
+
+The partner is evaluated independently with the inverse exchange. Trading a 15-point starting RB for a 20-point WR who cannot improve any WR/FLEX slot can therefore reduce your projected lineup total. Per-week results and before/after lineups expose the replacement player and bye coverage rather than presenting the sum of traded-player PPG as value.
+
+Projection source and availability information accompanies the forecast. Future weeks use ESPN's week-specific projections when present; any fallback baseline is labeled, and missing projections are not treated as a confident zero-point forecast. Current injury designations are not assumed permanent: later weeks are conditional on availability, as described in the calculator. This is a projected optimal-lineup comparison, not a trade acceptance model or a forecast of actual lineup decisions. It does not add waiver replacements, enforce transaction/roster limits, predict future injuries, or submit trades to ESPN. Its inputs refresh when the dashboard is rebuilt.
 
 ### Leaderboard
 

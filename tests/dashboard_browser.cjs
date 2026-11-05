@@ -129,6 +129,7 @@ const server=http.createServer((request,response)=>{
       await touchPage.waitForFunction(()=>!rosterSdPopover.classList.contains('active'));
     }finally{await touchPage.close();}
     await require('./mobile_layout.cjs')(page);
+    await require('./trade_calculator_browser.cjs')(page);
     assert.deepEqual(errors,[]);
     console.log('PASS: global/local selection, native history, real legend clicks, sorts, roster popout, pie highlight, matchup, reload, 320/390/430px layout, and touch distribution sheet');
   }finally{await browser.close();}

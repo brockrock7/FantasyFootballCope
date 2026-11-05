@@ -45,8 +45,17 @@ module.exports=async function verifyMobileLayout(page){
   if(process.env.DASHBOARD_SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.DASHBOARD_SCREENSHOT_DIR,'matchup-mobile.png'),fullPage:true});
   await page.setViewportSize({width:1440,height:1000});
   await page.locator('[data-tab="team"]').click();await page.locator('[data-team-view="position"]').click();
-  await page.waitForFunction(()=>Chart.getChart('positionTotalsChart').scales.x.type==='category');
-  assert.equal(await page.evaluate(()=>Chart.getChart('positionTotalsChart').options.indexAxis),'x','desktop orientation restored');
+  await page.waitForFunction(()=>Chart.getChart('positionTotalsChart').scales.x.type==='linear');
+  assert.equal(await page.evaluate(()=>Chart.getChart('positionTotalsChart').options.indexAxis),'y','desktop bars remain horizontal');
+  const bars=await page.evaluate(()=>Object.values(Chart.instances).filter(chart=>chart.config.type==='bar').map(chart=>({id:chart.canvas.id,axis:chart.options.indexAxis,x:chart.scales.x.type,y:chart.scales.y.type,series:chart.data.datasets.map((dataset,index)=>({type:dataset.type||chart.config.type,index:chart.getDatasetMeta(index).iScale.axis,value:chart.getDatasetMeta(index).vScale.axis}))})));
+  for(const chart of bars){
+    assert.equal(chart.axis,'y',chart.id+' is horizontal');assert.equal(chart.x,'linear');assert.equal(chart.y,'category');
+    chart.series.forEach(series=>{assert.equal(series.index,'y',chart.id+' '+series.type+' categories');assert.equal(series.value,'x',chart.id+' '+series.type+' values');});
+  }
+  await page.locator('[data-team-view="differential"]').click();
+  await page.locator('#differentialTeams button').nth(2).click();
+  const diff=await page.evaluate(()=>({min:differentialChart.options.scales.x.min,max:differentialChart.options.scales.x.max,expected:Math.max(1,...differentialChart.data.datasets[0].data.map(Math.abs))}));
+  assert.equal(diff.min,-diff.expected);assert.equal(diff.max,diff.expected);
   console.log('Mobile table widths at390px:',JSON.stringify(metrics));
-  console.log('PASS: every tab/subtab at320/390/430/768px, intrinsic tables, compact standings/matchup, touch legends with URL history, horizontal phone bars, desktop restoration');
+  console.log('PASS: every tab/subtab at320/390/430/768px, intrinsic tables, compact standings/matchup, touch legends with URL history, all bars horizontal on phone and desktop, mixed reference lines and differential bounds');
 };

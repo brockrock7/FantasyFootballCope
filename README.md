@@ -8,11 +8,11 @@ This ESPN Fantasy dashboard includes:
 - **Matchup stats**: mirrored starter projections, simulated team-score distributions, and win-probability history. The logger targets ten-minute observations during NFL games; GitHub Actions runs every five minutes but may delay scheduled runs. The page checks for fresh data once per minute.
 - **Team Stats**: positional and acquisition breakdowns, starter/bench results, and season-long roster player statistics.
 - **Luck Stats**: expected wins, schedule luck, and simulated schedule outcomes.
-- **Trades** and **Leaderboard**: completed trade records, trade impact, and season leaders.
+- **Trades** and **Leaderboard**: completed trade records, trade impact, a lineup-aware Trade Calculator using weekly projections and byes, and season leaders.
 
 Roster averages and standard deviations use a player's completed scoring weeks across all fantasy teams and exclude NFL bye weeks. D/ST rows use NFL team logos when ESPN provides a recognizable team name or abbreviation.
 
-The global team buttons select a team across charts. Selections, tabs, sorts, and chart legend visibility are stored in the URL and support native Back/Forward. See the [mobile readability plan](docs/MOBILE_READABILITY_PLAN.md) for proposed phone improvements.
+The global team buttons select a team across charts. Selections, tabs, sorts, and chart legend visibility are stored in the URL and support native Back/Forward. See the [mobile readability plan](docs/MOBILE_READABILITY_PLAN.md) for phone layout details and verification. Every bar chart is horizontal. The [pre-redesign backup](docs/DASHBOARD_BACKUP.md) preserves a restorable version.
 
 Live win probability uses individual positive lognormal outcomes plus observed nonpositive history, centered on remaining ESPN projections. See the [matchup scoring model](docs/MATCHUP_SCORING_MODEL.md) for assumptions and limitations. Trade impact compares raw and recipient-started player points in scoring weeks after the trade week.
 
