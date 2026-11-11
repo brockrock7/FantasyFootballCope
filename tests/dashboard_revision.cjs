@@ -49,6 +49,7 @@ module.exports=async function(page){
   await page.locator('.suggestions-content [data-kind="positions"]:not([data-value="all"])').nth(1).click();
   assert.equal(await page.evaluate(()=>suggestedTrades.getState().partners.length),2);
   assert.equal(await page.evaluate(()=>suggestedTrades.getState().positions.length),2);
+  assert(await page.evaluate(()=>[...document.querySelectorAll('.suggestions-table tbody .suggestion-player small')].every(node=>suggestedTrades.getState().positions.includes(node.textContent))),'every sent and received player belongs to an allowed position');
   const decoyCount=await page.locator('.suggestions-table tbody tr').count();
   assert(await page.locator('.suggestions-table tbody td:nth-child(4)').evaluateAll(cells=>cells.every(cell=>Number(cell.textContent)>0)));
   console.log('PASS: ascending weeks, mobile/desktop matchup fit, actual-score center, historical card visibility, radar order, team-specific domain, mean delta, suggested trade click modes, multi-select filters and sort. Counts:',realCount,decoyCount);
