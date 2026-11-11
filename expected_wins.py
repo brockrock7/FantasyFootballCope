@@ -2205,8 +2205,8 @@ const positionButtons=fillTeamButtons('positionTeams',showPosition);
 const sourceColors={Drafted:'#4da3ff',Traded:'#da70d6',Waivers:'#f5a623'};
 const sourceStatRows=D.teams.map(team=>{const games=Math.max(1,Number(D.completed_week)||0);const row={team};D.sources.forEach(source=>{row[source]=Number(D.source_totals?.[team]?.[source]||0);row[source+'_display']=`${row[source].toFixed(1)} (${(row[source]/games).toFixed(1)} PPG)`;});return row;});
 renderSortableStatsTable('sourceTotalsTable',[{key:'team',label:'Team',render:row=>teamAbbrev(row.team)},...D.sources.map(source=>({key:source,label:source,render:row=>row[source+'_display']}))],sourceStatRows);
-new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:D.sources.map(source=>({label:source,data:D.teams.map(team=>Number(D.source_totals?.[team]?.[source]||0)),backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Fantasy points'}}}}});
-const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:false,min:positionAxisMin,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
+new Chart(document.getElementById('sourceTotalsChart'),{type:'bar',data:{labels:D.teams.map(teamAbbrev),datasets:D.sources.map(source=>({label:source,data:D.teams.map(team=>Number(D.source_totals?.[team]?.[source]||0)),backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{title:items=>items.length?D.teams[items[0].dataIndex]:''}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,min:0,title:{display:true,text:'Fantasy points'}}}}});
+const sourceChart=new Chart(document.getElementById('sourceChart'),{type:'bar',data:{labels:D.weeks.map(w=>'W'+w),datasets:D.sources.map(source=>({label:source,data:[],backgroundColor:sourceColors[source]}))},options:{maintainAspectRatio:false,plugins:{title:{display:true,text:''}},interaction:{mode:'index',intersect:false},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,min:0,max:positionAxisMax,title:{display:true,text:'Fantasy points'}}}}});
 function showSource(team){const rows=D.weekly_sources[team]||[];sourceChart.options.plugins.title.text=teamAbbrev(team);sourceChart.data.datasets.forEach((dataset,index)=>dataset.data=rows.map(row=>row[D.sources[index]]||0));sourceChart.update();}
 const sourceButtons=fillTeamButtons('sourceTeams',showSource);
 const starterBenchRows=D.teams.map(team=>{const values=D.starter_bench_totals?.[team]||{actual:0,bench:0,optimal:0,left:0,left_ppg:0,actual_ppg:0,optimal_ppg:0,games:0};return{team,...values,optimal_pct:values.optimal>0?100*values.actual/values.optimal:0};});
@@ -2526,7 +2526,10 @@ __TRADE_CALCULATOR_JS__
 const tradeCalculator=TradeCalculator.mount(document.getElementById('tradeCalculator'),D,{onChange:()=>queueMicrotask(()=>saveDashboardState())});
 __SUGGESTED_TRADES_JS__
 const suggestedTrades=SuggestedTrades.mount(document.getElementById('suggestedTrades'),D,()=>saveDashboardState());
-document.querySelector('[data-trades-view="suggestions"]').addEventListener('click',()=>suggestedTrades.enter());
+const suggestedTab=document.querySelector('[data-trades-view="suggestions"]');
+let lastSuggestedTap=-Infinity;
+suggestedTab.addEventListener('click',event=>{const now=event.timeStamp,doubleTap=event.isTrusted&&now-lastSuggestedTap<500;lastSuggestedTap=event.isTrusted?now:-Infinity;suggestedTrades.enter(doubleTap?'real':'decoy');});
+suggestedTab.addEventListener('dblclick',()=>suggestedTrades.enter('real'));
 __DASHBOARD_STATE__
 __DASHBOARD_MOBILE_JS__
 </script></body></html>'''.replace("__DATA__", data).replace(

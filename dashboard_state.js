@@ -100,7 +100,6 @@ async function restoreDashboardState(state){
   try{
     // A missing state represents the original default view when going Back.
     state=state||initialDashboardState;
-    if(state.tab!=="trades"||state.sub?.trades!=="suggestions")document.querySelector(".suggestions-gate")?.close();
     chartPreferences=state.charts||{};preferredLiveTeam='';
     hideRosterDistribution();clickedDistribution='';
     markGlobalTeam(state.globalTeam);

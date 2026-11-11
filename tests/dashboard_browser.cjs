@@ -127,6 +127,10 @@ const server=http.createServer((request,response)=>{
       if(process.env.DASHBOARD_SCREENSHOT_DIR)await touchPage.screenshot({path:path.join(process.env.DASHBOARD_SCREENSHOT_DIR,'roster-sheet-mobile.png')});
       await touchPage.locator('.sd-backdrop').tap({position:{x:8,y:8}});
       await touchPage.waitForFunction(()=>!rosterSdPopover.classList.contains('active'));
+    await touchPage.locator('[data-tab="trades"]').tap();
+    const suggestedTab=touchPage.locator('[data-trades-view="suggestions"]');
+    await suggestedTab.tap();assert.equal(await touchPage.evaluate(()=>suggestedTrades.getMode()),'decoy');
+    await suggestedTab.tap();assert.equal(await touchPage.evaluate(()=>suggestedTrades.getMode()),'real','double touch opens real suggestions');
     }finally{await touchPage.close();}
     await require('./mobile_layout.cjs')(page);
     await require('./trade_calculator_browser.cjs')(page);

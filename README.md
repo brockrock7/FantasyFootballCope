@@ -8,7 +8,7 @@ This ESPN Fantasy dashboard includes:
 - **Matchup stats**: mirrored starter projections, simulated team-score distributions, and win-probability history. The logger targets ten-minute observations during NFL games; GitHub Actions runs every five minutes but may delay scheduled runs. The page checks for fresh data once per minute.
 - **Team Stats**: positional and acquisition breakdowns, starter/bench results, and season-long roster player statistics.
 - **Luck Stats**: expected wins, schedule luck, and simulated schedule outcomes.
-- **Trades** and **Leaderboard**: completed trade records, trade impact, a lineup-aware Trade Calculator with weekly projections, waiver replacements, byes and scheduled-opponent effects, plus code-selected Suggested Trades views (see the guide), and season leaders.
+- **Trades** and **Leaderboard**: completed trade records, trade impact, a lineup-aware Trade Calculator with weekly projections, waiver replacements, byes and scheduled-opponent effects, plus single/double-tap Suggested Trades views with packages up to four players per side (see the guide), and season leaders.
 
 Roster averages and standard deviations use a player's completed scoring weeks across all fantasy teams and exclude NFL bye weeks. D/ST rows use NFL team logos when ESPN provides a recognizable team name or abbreviation.
 

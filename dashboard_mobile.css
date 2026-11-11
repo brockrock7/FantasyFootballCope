@@ -130,3 +130,6 @@ body{line-height:1.45;-webkit-tap-highlight-color:transparent}
 @media(max-width:650px){.matchup-player>.matchup-photo{display:none}.suggestions-table td{padding:8px 4px;white-space:normal!important;max-width:12ch}.suggestions-table th{padding:6px 3px}.suggestions-table th button{font-size:10px;white-space:normal}.suggestions-table td:nth-child(n+4){white-space:nowrap!important;font-variant-numeric:tabular-nums}}
 
 .matchup-mirror tfoot th:nth-child(2){border-right:0}.matchup-mirror tfoot th:nth-child(3){border-right:2px solid var(--line)}
+
+.suggestion-player+.suggestion-player{margin-top:9px;padding-top:8px;border-top:1px solid var(--line)}
+[data-trades-view="suggestions"]{touch-action:manipulation}
