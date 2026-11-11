@@ -4,6 +4,21 @@
     if(mode==='real')return a>=.5&&b>=.5?{a,b}:null;
     return a<=-.1&&a>=-3&&b<=-.1&&b>=-3?{a:Math.abs(a)*1.12+.1,b:Math.abs(b)*1.12+.1}:null;
   }
+  function hasOnlyContributors(data,evaluation){
+    // Remove each incoming player from the completed trade's receiving roster.
+    // A starting assignment alone is insufficient: tied alternatives can replace it.
+    return [evaluation.a,evaluation.b].every(side=>{
+      const sent=new Set(side.sent.map(player=>String(player.id)));
+      const roster=side.team.players.filter(player=>!sent.has(String(player.id))).concat(side.received);
+      return side.received.every(player=>{
+        const weeks=side.weeks.filter(row=>row.after.lineup.some(slot=>slot.player&&String(slot.player.id)===String(player.id)));
+        if(!weeks.length)return false;
+        const without=roster.filter(candidate=>String(candidate.id)!==String(player.id));
+        const marginal=weeks.reduce((sum,row)=>sum+row.after.total-root.TradeCalculator.withReplacements(without,data.lineup_slots||[],row.week,data.free_agents).total,0);
+        return marginal>1e-6;
+      });
+    });
+  }
   const packageKey=row=>row.send.map(p=>String(p.id)).sort().join(',')+'|'+row.receive.map(p=>String(p.id)).sort().join(',');
   const average=p=>{const rows=Object.values(p.projections||{}).filter(row=>row.available!==false&&Number.isFinite(row.points));return rows.length?rows.reduce((sum,row)=>sum+row.points,0)/rows.length:0;};
   function seeds(rows){
@@ -17,7 +32,7 @@
     async function assess(candidate,bucket){
       if(cancelled())return;
       const key=packageKey(candidate);if(seen.has(key))return;seen.add(key);
-      const row={...candidate,...evaluate(candidate)};bucket.push(row);results.push(row);
+      const row={...candidate,...evaluate(candidate)};bucket.push(row);if(row.contributes!==false)results.push(row);
       count++;
       if(count%24===0||performance.now()-lastYield>=16){onBatch(count);await new Promise(resolve=>setTimeout(resolve,0));lastYield=performance.now();}
     }
@@ -35,7 +50,7 @@
       }
       for(const candidate of candidates.values()){if(cancelled())return [];await assess(candidate,bucket);}
     }
-    return results;
+    onBatch(count);return results;
   }
   function mount(host,D,onChange){
     const data=D.trade_calculator,ids=Object.keys(data.teams),cache=new Map();
@@ -47,7 +62,7 @@
     function button(label,kind,value,active){return `<button type="button" data-kind="${kind}" data-value="${escape(value)}" class="team-button${active?' active':''}" aria-pressed="${active}">${escape(label)}</button>`;}
     function render(){
       const positions=[...new Set(Object.values(data.teams).flatMap(t=>t.players.map(p=>p.position)))];
-      content.innerHTML=`<h2>Suggested Trades</h2><p>Candidate trades with 1–4 players per side, including byes, replacement players, and scheduled head-to-head effects. Values are balance points per remaining week.</p><div class="toolbar"><span>Your team</span><div class="team-buttons">${ids.map(id=>button(abbr(id),'team',id,id===state.team)).join('')}</div></div><div class="toolbar"><span>Trade partners · select multiple</span><div class="team-buttons">${button('All','partners','all',!state.partners.length)}${ids.filter(id=>id!==state.team).map(id=>button(abbr(id),'partners',id,state.partners.includes(id))).join('')}</div></div><div class="toolbar"><span>Allowed positions · select multiple</span><div class="team-buttons">${button('All','positions','all',!state.positions.length)}${positions.map(pos=>button(pos,'positions',pos,state.positions.includes(pos))).join('')}</div></div><p class="suggestions-status" role="status"></p><div class="scroll"><table class="suggestions-table"></table></div>`;
+      content.innerHTML=`<h2>Suggested Trades</h2><p>Candidate trades with 1–4 players per side, including byes, replacement players, and scheduled head-to-head effects. Every included player must improve their receiving team’s projected lineup. Values are balance points per remaining week.</p><div class="toolbar"><span>Your team</span><div class="team-buttons">${ids.map(id=>button(abbr(id),'team',id,id===state.team)).join('')}</div></div><div class="toolbar"><span>Trade partners · select multiple</span><div class="team-buttons">${button('All','partners','all',!state.partners.length)}${ids.filter(id=>id!==state.team).map(id=>button(abbr(id),'partners',id,state.partners.includes(id))).join('')}</div></div><div class="toolbar"><span>Allowed positions · select multiple</span><div class="team-buttons">${button('All','positions','all',!state.positions.length)}${positions.map(pos=>button(pos,'positions',pos,state.positions.includes(pos))).join('')}</div></div><p class="suggestions-status" role="status"></p><div class="scroll"><table class="suggestions-table"></table></div>`;
       draw();
     }
     function draw(){
@@ -68,9 +83,11 @@
         const offset=progress;
         const found=await searchPackages(own,data.teams[partner].players,candidate=>{
           const evaluation=TradeCalculator.evaluateTrade(data,{teamA:team,teamB:partner,sendA:candidate.send.map(p=>String(p.id)),sendB:candidate.receive.map(p=>String(p.id)),startWeek:data.weeks[0],endWeek:data.weeks.at(-1)});
-          return {partner,sendName:candidate.send.map(p=>p.name).join(', '),receiveName:candidate.receive.map(p=>p.name).join(', '),partnerName:abbr(partner),a:evaluation.a.delta/n,b:evaluation.b.delta/n};
+          const a=evaluation.a.delta/n,b=evaluation.b.delta/n;
+          const contributes=!!(classifySuggestion(a,b,'real')||classifySuggestion(a,b,'decoy'))&&hasOnlyContributors(data,evaluation);
+          return {partner,sendName:candidate.send.map(p=>p.name).join(', '),receiveName:candidate.receive.map(p=>p.name).join(', '),partnerName:abbr(partner),a,b,contributes};
         },{cancelled:()=>run!==revision,onBatch:count=>{progress=offset+count;content.querySelector('.suggestions-status').textContent=`Evaluating roster fit… ${progress} packages`;}});
-        if(run!==revision)return;result.push(...found);progress=result.length;rows=result;draw();
+        if(run!==revision)return;result.push(...found);rows=result;draw();
       }
       if(run!==revision)return;computingTeam=null;cache.set(team,result);rows=result;draw();
     }
@@ -83,6 +100,6 @@
     });
     return {enter,getMode:()=>mode,getState:()=>({...state}),setState(next){if(!next)return;state={...state,...next,team:ids.includes(next.team)?next.team:ids[0],partners:Array.isArray(next.partners)?next.partners.filter(id=>ids.includes(id)):[],positions:Array.isArray(next.positions)?next.positions:[]};if(mode){render();compute();}},selectTeam(name){const id=ids.find(id=>data.teams[id].name===name);if(id){state.team=id;state.partners=state.partners.filter(value=>value!==id);if(mode){render();compute();}}}};
   }
-  if(typeof module!=='undefined')module.exports={classifySuggestion,searchPackages};
-  root.SuggestedTrades={mount,classifySuggestion,searchPackages};
+  if(typeof module!=='undefined')module.exports={classifySuggestion,searchPackages,hasOnlyContributors};
+  root.SuggestedTrades={mount,classifySuggestion,searchPackages,hasOnlyContributors};
 })(typeof window==='undefined'?globalThis:window);

@@ -35,6 +35,16 @@ module.exports=async function(page){
   const packageSizes=await page.locator('.suggestions-table tbody tr').evaluateAll(rows=>rows.map(row=>[row.cells[0].querySelectorAll('.suggestion-player').length,row.cells[1].querySelectorAll('.suggestion-player').length]));
   assert(packageSizes.some(sizes=>sizes.some(size=>size>1)),'multi-player suggestions are displayed');
   assert(packageSizes.every(sizes=>sizes.every(size=>size>=1&&size<=4)),'packages stay within four per side');
+  assert(await page.evaluate(()=>{
+    const data=D.trade_calculator,own=suggestedTrades.getState().team;
+    return [...document.querySelectorAll('.suggestions-table tbody tr')].slice(0,8).every(row=>{
+      const partner=Object.keys(data.teams).find(id=>(D.team_abbrevs[data.teams[id].name]||data.teams[id].name)===row.cells[2].textContent);
+      const ids=(cell,team)=>[...cell.querySelectorAll('.suggestion-player')].map(node=>String(data.teams[team].players.find(p=>p.name===node.firstChild.textContent).id));
+      const state={teamA:own,teamB:partner,sendA:ids(row.cells[0],own),sendB:ids(row.cells[1],partner),startWeek:data.weeks[0],endWeek:data.weeks.at(-1)};
+      const full=TradeCalculator.evaluateTrade(data,state);
+      return [['sendA','b'],['sendB','a']].every(([field,receiver])=>state[field].every(id=>full[receiver].after-TradeCalculator.evaluateTrade(data,{...state,[field]:state[field].filter(value=>value!==id)})[receiver].after>1e-6));
+    });
+  }),'each displayed player improves their receiving roster compared with the same trade without that player');
   await page.locator('.suggestions-table [data-sort="b"]').click();
   assert.equal(await page.evaluate(()=>suggestedTrades.getState().sort),'b');
   await page.setViewportSize({width:390,height:844});
