@@ -38,6 +38,12 @@ module.exports=async function verifyTradeCalculator(page){
     assert.equal(await page.evaluate(()=>tradeCalculator.evaluate().weeks.length),results.weeks-1);
     await page.goBack();await page.waitForFunction(week=>tradeCalculator.getState().startWeek===week,trade.startWeek);
   }
+  await page.locator('.tc-week-choice').last().click();
+  assert.equal(await page.evaluate(()=>tradeCalculator.getState().focusWeek),Number(available.at(-1)));
+  await page.locator('.tc-lineup-view').selectOption('before');
+  await page.waitForFunction(()=>dashboardState().trade.lineupView==='before');
+  assert((await page.locator('.tc-lineup-caption').allTextContents()).every(text=>text.includes('Before trade')));
+  await page.goBack();await page.waitForFunction(()=>tradeCalculator.getState().lineupView==='after');
   for(const width of [320,390,430,768,1440]){
     await page.setViewportSize({width,height:900});
     const geometry=await page.evaluate(()=>{
@@ -45,6 +51,9 @@ module.exports=async function verifyTradeCalculator(page){
       return {overflow:document.documentElement.scrollWidth>innerWidth,sameTop:Math.abs(rosters[0].top-rosters[1].top)<1,separate:rosters[0].right<=rosters[1].left,
         controls:[...document.querySelectorAll('#tradeCalculator select,#tradeCalculator button')].filter(node=>node.getClientRects().length).map(node=>node.getBoundingClientRect().height)};
     });
+    const board=await page.evaluate(()=>['.tc-projected-home','.tc-weekly','.tc-projected-away'].map(selector=>{const r=document.querySelector(selector).getBoundingClientRect();return {left:r.left,right:r.right,top:r.top};}));
+    if(width>700)assert(board[0].right<=board[1].left&&board[1].right<=board[2].left,'week comparison between rosters');
+    else assert(board[1].top<board[0].top&&Math.abs(board[0].top-board[2].top)<1,'phone weeks above paired rosters');
     assert(!geometry.overflow,'no trade page overflow '+width);assert(geometry.sameTop&&geometry.separate,'side-by-side rosters '+width);
     assert(geometry.controls.every(height=>height>=44),'trade touch controls '+width);
   }
