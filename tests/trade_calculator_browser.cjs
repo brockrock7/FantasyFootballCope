@@ -18,7 +18,7 @@ module.exports=async function verifyTradeCalculator(page){
   const results=await page.evaluate(()=>{
     const result=tradeCalculator.evaluate();
     return {weeks:result.weeks.length,a:result.a.delta,b:result.b.delta,
-      weeklyA:result.a.weeks.reduce((sum,row)=>sum+row.delta,0),
+      weeklyA:result.a.weeks.reduce((sum,row)=>sum+row.balance,0),
       unique: [result.a,result.b].every(side=>side.weeks.every(row=>[row.before,row.after].every(lineup=>{
         const ids=lineup.lineup.filter(slot=>slot.player).map(slot=>slot.player.id);
         return ids.length===new Set(ids).size;
@@ -64,14 +64,14 @@ module.exports=async function verifyTradeCalculator(page){
   assert.equal((await page.evaluate(()=>tradeCalculator.getState())).sendA.length,0);
   assert.equal((await page.evaluate(()=>tradeCalculator.evaluate())).a.delta,0);
   await page.locator('[data-trades-view="history"]').click();
-  const history=await page.evaluate(()=>({raw:teamTradeChart.data.datasets[0].borderDash,started:teamTradeChart.data.datasets[1].borderDash,
+  const history=await page.evaluate(()=>({raw:teamTradeChart.data.datasets[0].fill,series:teamTradeChart.data.datasets.map(d=>d.label),
     outlines:[...document.querySelectorAll('.trade-sent img,.trade-sent .roster-photo')].map(node=>getComputedStyle(node).borderColor),
-    circles:[...individualTradeCharts].flatMap(chart=>chart.data.datasets.filter(dataset=>!dataset.hideFromLegend).map(dataset=>({radius:dataset.pointRadius,colors:dataset.pointBackgroundColor})))}));
+    circles:[...individualTradeCharts].flatMap(chart=>chart.data.datasets.filter(dataset=>!dataset.hideFromLegend).map(dataset=>({radius:dataset.pointRadius,colors:dataset.backgroundColor})))}));
   const legends=await page.evaluate(()=>Object.values(Chart.instances).flatMap(chart=>(chart.legend?.legendItems||[]).map(item=>({text:item.text,style:item.pointStyle}))));
   assert(legends.every(item=>item.text!=='0 points'&&item.style==='line'),'all legend keys are segments without zero reference');
   assert.equal(await page.evaluate(()=>[...individualTradeCharts].every(chart=>chart.data.datasets.some(dataset=>dataset.fill?.above==='rgba(63,185,80,.18)'))),true,'trade green/red regions');
-  assert(history.raw.length>0);assert.equal(history.started.length,0);
+  assert(history.raw.above);assert(!history.series.some(label=>label.includes('Starter')));
   assert(history.outlines.every(color=>color==='rgb(245, 166, 35)'),'sent photos orange');
-  history.circles.forEach(dataset=>{assert(dataset.radius>=6);assert(Array.isArray(dataset.colors));});
+  history.circles.forEach(dataset=>{assert(dataset.radius>=3);assert.equal(typeof dataset.colors,'string');});
   console.log('PASS: trade roster selections, exact result totals, URL history/reload/week range, global team, 320–1440px side-by-side layout, touch controls, and trade history styles');
 };

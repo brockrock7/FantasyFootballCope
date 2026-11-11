@@ -25,6 +25,13 @@ def load_logger():
 
 
 class ScoreModelTests(unittest.TestCase):
+    def test_participation_excludes_absences_but_keeps_recorded_zero_and_injury_exit(self):
+        from scoring_model import participated_week
+        self.assertFalse(participated_week(0, [{"breakdown": {}, "projected_points": 10}]))
+        self.assertTrue(participated_week(0, [{"breakdown": {"rushingAttempts": 1}}]))
+        self.assertTrue(participated_week(-2, [{"breakdown": {}}]))
+        self.assertTrue(participated_week(1.2, []))
+
     def test_central_interval_uses_probability_quantiles_without_mutating_draws(self):
         samples = list(reversed(range(101)))
         original = samples.copy()

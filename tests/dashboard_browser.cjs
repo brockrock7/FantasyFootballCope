@@ -76,8 +76,8 @@ const server=http.createServer((request,response)=>{
     }
     if(await page.locator('#liveWeeks button').count()>1){
       const current=(await state()).live;
-      await page.locator('#liveWeeks button').last().click();
-      await page.waitForFunction(()=>liveChart.data.datasets[0].data.length>0);
+      await page.locator('#liveWeeks button').first().click();
+      await page.waitForFunction(()=>Number(selectedLiveWeek)<Number(D.current_week));
       const historical=(await state()).live;
       assert.notEqual(historical.week,current.week);
       await page.reload({waitUntil:'networkidle'});
@@ -130,6 +130,7 @@ const server=http.createServer((request,response)=>{
     }finally{await touchPage.close();}
     await require('./mobile_layout.cjs')(page);
     await require('./trade_calculator_browser.cjs')(page);
+    await require('./dashboard_revision.cjs')(page);
     assert.deepEqual(errors,[]);
     console.log('PASS: global/local selection, native history, real legend clicks, sorts, roster popout, pie highlight, matchup, reload, 320/390/430px layout, and touch distribution sheet');
   }finally{await browser.close();}

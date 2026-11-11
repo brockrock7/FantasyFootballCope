@@ -102,3 +102,21 @@ check('vacant slots use distinct available free agents and respect their byes',(
  assert.equal(tradeRating(10,12,2),'Mutually beneficial');assert.equal(tradeRating(-10,-12,2),'Mutually detrimental');
  assert.equal(tradeRating(10,-12,2),'One-sided');assert.equal(tradeRating(.5,-.5,2),'Even');
 });
+
+check('head-to-head balance subtracts only the partner gain in scheduled meeting weeks',()=>{
+ const fixture=data([player(1,'RB',10),player(2,'WR',20)],[player(3,'WR',12),player(4,'RB',20)],['RB','WR']);
+ const st=state({sendA:['1'],sendB:['3']}),base=evaluateTrade(fixture,st);
+ fixture.head_to_head={a:{1:'b'}};
+ const result=evaluateTrade(fixture,st);
+ assert.equal(result.a.delta,base.a.delta-base.b.weeks[0].delta);
+ assert.equal(result.b.delta,base.b.delta-base.a.weeks[0].delta);
+ assert.equal(result.a.weeks[1].opponentEffect,0);
+});
+check('suggestion modes select and transform only their specified trade bands',()=>{
+ const {classifySuggestion}=require('../suggested_trades.js');
+ assert.deepEqual(classifySuggestion(2,1,'real'),{a:2,b:1});
+ assert.equal(classifySuggestion(-1,-2,'real'),null);
+ assert.equal(classifySuggestion(-4,-1,'decoy'),null);
+ assert.equal(classifySuggestion(2,1,'decoy'),null);
+ const decoy=classifySuggestion(-1,-2,'decoy');assert(decoy.a>1&&decoy.b>2);
+});

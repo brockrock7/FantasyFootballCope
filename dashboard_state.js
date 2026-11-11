@@ -44,7 +44,7 @@ function dashboardState(){
   return {v:dashboardViewVersion,tab:document.querySelector('.tab.active')?.dataset.tab,sub,globalTeam,
     buttons:selectedButtons(),live:{week:selectedLiveWeek,matchup:selectedLiveMatchup},sorts:tableSorts(),
     pins:{power:pinnedPowerTeam===null?null:D.teams[pinnedPowerTeam],multiverse:pinnedMultiverseIndex===null?null:D.teams[pinnedMultiverseIndex]},
-    charts:captureChartPreferences(),distribution:clickedDistribution,trade:tradeCalculator.getState(),
+    charts:captureChartPreferences(),distribution:clickedDistribution,trade:tradeCalculator.getState(),suggestions:suggestedTrades.getState(),
     details:[...document.querySelectorAll('details')].map((detail,index)=>detail.open?index:null).filter(index=>index!==null)};
 }
 function saveDashboardState(replace=false){
@@ -74,7 +74,7 @@ function chooseGlobalTeam(team){
   if(!D.teams.includes(team))return;
   markGlobalTeam(team);
   teamControls.forEach(control=>control.choose(team));
-  tradeCalculator.selectTeam(team);
+  tradeCalculator.selectTeam(team);suggestedTrades.selectTeam(team);
   showMultiverseTeam(team);
   pinnedPowerTeam=D.teams.indexOf(team);highlightPowerTeam(pinnedPowerTeam);
   pinnedMultiverseIndex=D.teams.indexOf(team);highlightMultiverseLine(pinnedMultiverseIndex);
@@ -100,6 +100,7 @@ async function restoreDashboardState(state){
   try{
     // A missing state represents the original default view when going Back.
     state=state||initialDashboardState;
+    if(state.tab!=="trades"||state.sub?.trades!=="suggestions")document.querySelector(".suggestions-gate")?.close();
     chartPreferences=state.charts||{};preferredLiveTeam='';
     hideRosterDistribution();clickedDistribution='';
     markGlobalTeam(state.globalTeam);
@@ -112,6 +113,7 @@ async function restoreDashboardState(state){
       if(!['globalTeams','liveWeeks','liveMatchups'].includes(host)&&typeof title==='string')chooseButton(host,title);
     });
     tradeCalculator.setState(state.trade||initialDashboardState.trade,{silent:true});
+    suggestedTrades.setState(state.suggestions||initialDashboardState.suggestions);
     const week=String(state.live?.week||'');
     if([...liveWeeksHost.children].some(button=>button.textContent==='W'+week)){
       selectedLiveWeek=week;

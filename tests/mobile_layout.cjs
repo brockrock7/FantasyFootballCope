@@ -10,6 +10,7 @@ module.exports=async function verifyMobileLayout(page){
       const subtabs=await page.locator(`#panel-${tab} .subtab`).count();
       for(let index=0;index<Math.max(1,subtabs);index++){
         if(subtabs)await page.locator(`#panel-${tab} .subtab`).nth(index).click();
+        if(await page.locator('.suggestions-gate[open]').count())await page.locator('.gate-cancel').click();
         await page.waitForFunction(()=>document.documentElement.scrollWidth<=innerWidth);
         const dimensions=await page.evaluate(()=>[...document.querySelectorAll('.panel.active table')].filter(table=>table.getBoundingClientRect().width).map(table=>({id:table.id||table.className,width:Math.round(table.getBoundingClientRect().width),layout:getComputedStyle(table).tableLayout})));
         dimensions.forEach(table=>assert.equal(table.layout,'auto',table.id+' uses content widths'));
@@ -35,7 +36,7 @@ module.exports=async function verifyMobileLayout(page){
   await page.goBack();await page.waitForFunction(()=>!dashboardState().charts.positionTotalsChart);
   await page.goForward();await page.waitForFunction(()=>!!dashboardState().charts.positionTotalsChart);
   await page.locator('[data-tab="live"]').click();
-  await page.locator('#liveWeeks button').first().click();
+  await page.locator('#liveWeeks button').last().click();
   await page.waitForFunction(()=>!!document.querySelector('.matchup-mirror'));
   const matchup=await page.evaluate(()=>({width:document.querySelector('.matchup-mirror').getBoundingClientRect().width,
     min:liveProjectionChart.options.scales.x.min,max:liveProjectionChart.options.scales.x.max,

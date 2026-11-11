@@ -253,7 +253,12 @@ def main():
     append_snapshot = not snaps or _sampling_bucket(int(snaps[-1][0]), league_game_windows, active)[0] != sample_bucket
     if append_snapshot:
         snaps.append([now, values])
-    snapshot.update({"week": week, "matchups": matchups, "snaps": snaps[-3000:],
+    from expected_wins import _live_lineup_projection
+    previews = [{"home_team": box.home_team.team_name, "away_team": box.away_team.team_name,
+                 "home": _live_lineup_projection(box.home_team.team_name, box.home_lineup, week),
+                 "away": _live_lineup_projection(box.away_team.team_name, box.away_lineup, week)}
+                for box in boxes if hasattr(box.home_team, "team_name") and hasattr(box.away_team, "team_name")]
+    snapshot.update({"previews": previews, "week": week, "matchups": matchups, "snaps": snaps[-3000:],
                      "game_windows": game_windows, "sampling_windows": sampling_windows,
                      "probability_model": "individual-lognormal-empirical-v1",
                      "sample_interval_minutes": sample_interval // 60})

@@ -54,6 +54,8 @@ def player_score_model(player, week, mean=None, sd=None, history_scale=1.0, hist
         if not 0 < past_week < int(week) or not isinstance(row, dict):
             continue
         score = row.get("points")
+        if "breakdown" in row and not participated_week(score, [row]):
+            continue
         projection = row.get("projected_points", row.get("projectedPoints"))
         if score is not None and _number(projection) > 0:
             ratios.append(_number(score) / _number(projection))
@@ -131,3 +133,12 @@ def central_score_interval(samples, coverage=.95):
 
     tail = (1 - coverage) / 2
     return [quantile(tail), quantile(1 - tail)]
+
+
+def participated_week(actual, rows):
+    """A score or recorded game-stat breakdown establishes participation.
+
+    A scheduled/projection-only zero without game stats is not evidence of play.
+    Current injury labels are deliberately not applied to historical games.
+    """
+    return _number(actual) != 0 or any(bool(row.get("breakdown")) for row in rows if isinstance(row, dict))

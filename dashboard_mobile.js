@@ -84,7 +84,7 @@ function refreshMobileCharts(){Object.values(Chart.instances).forEach(chart=>{ap
 phoneLayout.addEventListener('change',refreshMobileCharts);refreshMobileCharts();
 
 // Lead with the selected team's weekly detail; league comparisons follow below it.
-['position','acquisition'].forEach(view=>{
+['acquisition'].forEach(view=>{
   const section=document.getElementById('team-view-'+view),chart=document.getElementById(view==='position'?'positionChart':'sourceChart');
   const card=chart?.closest('.card');if(section&&card)section.prepend(card);
 });

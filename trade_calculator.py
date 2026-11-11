@@ -156,6 +156,7 @@ def player_forecasts(player, roster_row, weeks, current_week, projections):
     eligible = [slot_label(slot) for slot in getattr(player, "eligibleSlots", []) or []]
     eligible = list(dict.fromkeys(slot for slot in eligible if slot not in NONSTARTERS))
     return {
+        "mean_delta": roster_row.get("points_vs_projection_ppg"), "season_ppg": roster_row.get("ppg"),
         "id": player_id, "name": roster_row.get("name", str(getattr(player, "name", "Unknown player"))),
         "position": slot_label(roster_row.get("position", getattr(player, "position", ""))),
         "slot": slot_label(roster_row.get("slot", getattr(player, "lineupSlot", "BE"))),
@@ -167,7 +168,7 @@ def player_forecasts(player, roster_row, weeks, current_week, projections):
 
 
 def free_agent_forecasts(league, weeks, current_week):
-    """Page through currently available (not waiver-locked) players for each week."""
+    """Page through free agents and waiver-wire candidates for each week."""
     from espn_api.football.player import Player
     pool, forecasts = {}, {}
     schedule = league._get_all_pro_schedule()
@@ -175,7 +176,7 @@ def free_agent_forecasts(league, weeks, current_week):
     for week in weeks:
         offset = 0
         while True:
-            filters = {"players": {"filterStatus": {"value": ["FREEAGENT"]},
+            filters = {"players": {"filterStatus": {"value": ["FREEAGENT", "WAIVERS"]},
                        "limit": 1000, "offset": offset,
                        "sortPercOwned": {"sortPriority": 1, "sortAsc": False}}}
             response = league.espn_request.league_get(
@@ -226,6 +227,19 @@ def build_trade_calculator(league, current_rosters, schedule_meta):
         for player in players:
             sources.update(row["source"] for row in player["projections"].values())
         teams[team_id] = {"id": team_id, "name": str(team.team_name), "players": players}
+    head_to_head = {}
+    for team in league.teams:
+        opponents = {}
+        for period, opponent in enumerate(getattr(team, "schedule", []) or [], 1):
+            if period > int(getattr(league.settings, "reg_season_count", 14)):
+                continue
+            opponent_id = str(getattr(opponent, "team_id", ""))
+            if opponent_id not in teams or opponent_id == str(team.team_id):
+                continue
+            for w in periods.get(period, periods.get(str(period), [period])):
+                if int(w) in weeks:
+                    opponents[str(w)] = opponent_id
+        head_to_head[str(team.team_id)] = opponents
     free_agents = []
     free_agent_error = ""
     try:
@@ -239,10 +253,10 @@ def build_trade_calculator(league, current_rosters, schedule_meta):
         "NFL byes score zero. Current-week OUT/IR players are unavailable; future forecasts for injured players are conditional on returning, with no invented recovery date.",
         "This is a full-week hypothetical. Already-played games, lineup locks, trade processing, roster limits, and playoff qualification are not simulated.",
     ]
-    notes.append("Empty starter slots use the best projected currently available free agent, independently for each team and week. Waiver-locked players are excluded; availability may change. Occupied roster slots are retained.")
+    notes.append("Empty starter slots use the best projected currently available free agent, independently for each team and week. Waiver players are included as hypothetical claims; claim priority and availability may change. Occupied roster slots are retained.")
     if free_agent_error:
         notes.append(free_agent_error)
     if failed_weeks:
         notes.append("ESPN weekly forecast requests failed for week(s) " + ", ".join(map(str, failed_weeks)) + "; labeled baselines are used where available.")
     return {"weeks": weeks, "current_week": current_week, "lineup_slots": slots, "teams": teams,
-            "free_agents": free_agents, "free_agent_error": free_agent_error, "notes": notes, "projection_coverage": dict(sources), "failed_weeks": failed_weeks}
+            "head_to_head": head_to_head, "free_agents": free_agents, "free_agent_error": free_agent_error, "notes": notes, "projection_coverage": dict(sources), "failed_weeks": failed_weeks}

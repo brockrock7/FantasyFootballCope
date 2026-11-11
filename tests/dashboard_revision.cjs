@@ -1,0 +1,41 @@
+const assert=require('node:assert/strict');
+const path=require('node:path');
+module.exports=async function(page){
+  await page.locator('[data-tab="live"]').click();
+  const weeks=await page.locator('#liveWeeks button').allTextContents();
+  assert.deepEqual(weeks,[...weeks].sort((a,b)=>Number(a.slice(1))-Number(b.slice(1))));
+  await page.locator('#liveWeeks button').first().click();
+  assert(await page.locator('#projectionCard').isHidden());
+  assert.deepEqual(await page.locator('.matchup-mirror thead tr').last().locator('th').allTextContents(),['Starter','Proj.','Actual','Actual','Proj.','Starter']);
+  for(const width of [320,390,430]){
+    await page.setViewportSize({width,height:844});
+    const fits=await page.locator('.matchup-mirror-scroll').evaluate(node=>node.scrollWidth<=node.clientWidth+1);
+    assert(fits,'starter projections fit without horizontal scrolling at '+width);
+  }
+  await page.setViewportSize({width:1440,height:1000});
+  assert(await page.locator('.matchup-mirror').evaluate(node=>node.clientWidth>800));
+  await page.locator('#liveWeeks button').last().click();
+  assert(await page.locator('#projectionCard').isVisible());
+  await page.locator('[data-tab="team"]').click();await page.locator('[data-team-view="position"]').click();
+  assert(await page.locator('#team-view-position>.card').first().locator('#radars').count());
+  await page.locator('#positionTeams button').nth(2).click();
+  assert.equal(await page.evaluate(()=>posChart.options.scales.x.min),await page.evaluate(()=>Math.min(0,D.position_negative_min?.[document.querySelector('#positionTeams button.active').title]||0,...posChart.data.labels.map((_,i)=>posChart.data.datasets.reduce((sum,ds)=>sum+Math.min(0,ds.data[i]||0),0)))));
+  await page.locator('[data-team-view="roster"]').click();assert(await page.locator('#rosterStatsTable .mean-delta').count());
+  await page.locator('[data-tab="trades"]').click();await page.locator('[data-trades-view="suggestions"]').click();
+  await page.locator('.suggestions-gate input').fill('429');
+  const started=Date.now();await page.locator('.suggestions-gate button[type="submit"]').click();
+  await page.waitForFunction(()=>!document.querySelector('.suggestions-status').textContent.startsWith('Evaluating'),{},{timeout:180000});
+  console.log('Suggestions elapsed ms:',Date.now()-started);
+  const realCount=await page.locator('.suggestions-table tbody tr').count();
+  await page.locator('.suggestions-table [data-sort="b"]').click();
+  assert.equal(await page.evaluate(()=>suggestedTrades.getState().sort),'b');
+  await page.setViewportSize({width:390,height:844});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  if(process.env.DASHBOARD_SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.DASHBOARD_SCREENSHOT_DIR,'suggested-trades-mobile.png'),fullPage:true});
+  await page.locator('[data-trades-view="history"]').click();await page.locator('[data-trades-view="suggestions"]').click();
+  await page.locator('.suggestions-gate input').fill('111');await page.locator('.suggestions-gate button[type="submit"]').click();
+  await page.waitForFunction(()=>!document.querySelector('.suggestions-status').textContent.startsWith('Evaluating'));
+  const decoyCount=await page.locator('.suggestions-table tbody tr').count();
+  assert(await page.locator('.suggestions-table tbody td:nth-child(4)').evaluateAll(cells=>cells.every(cell=>Number(cell.textContent)>0)));
+  console.log('PASS: ascending weeks, mobile/desktop matchup fit, actual-score center, historical card visibility, radar order, team-specific domain, mean delta, suggested trade code modes and sort. Counts:',realCount,decoyCount);
+};
